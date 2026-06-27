@@ -1,23 +1,28 @@
 import os
+import json
 import httpx
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
- 
+
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 GREEN_API_ID = os.environ["GREEN_API_ID"]
 GREEN_API_TOKEN = os.environ["GREEN_API_TOKEN"]
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 PSYCHOLOGIST_PHONE = os.environ.get("PSYCHOLOGIST_PHONE", "")
- 
+GOOGLE_SERVICE_ACCOUNT = os.environ.get("GOOGLE_SERVICE_ACCOUNT", "")
+GOOGLE_PRIVATE_KEY = os.environ.get("GOOGLE_PRIVATE_KEY", "").replace("\\n", "\n")
+GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "")
+
 SYSTEM_PROMPT = """Ты — ассистент психолога Алии. Ты не проводишь терапию, не ставишь диагнозы, не даёшь медицинских назначений.
- 
+
 Твои задачи:
 1. Вежливо приветствовать и отвечать на вопросы
 2. Объяснять формат консультаций
 3. Предлагать запись
 4. При признаках кризиса — мягко рекомендовать обратиться за экстренной помощью (телефон доверия: 150)
- 
+
 Информация об Алие:
 - Консультации онлайн (видеосвязь)
 - Длительность сессии: 1,5 часа
@@ -25,33 +30,137 @@ SYSTEM_PROMPT = """Ты — ассистент психолога Алии. Ты
 - Пакет: 10 сессий — 200 000 тенге
 - Методы: ACT, КПТ (CBT), DBT
 - Работает с: тревогой, эмоциональной регуляцией, отношениями, самооценкой, стрессом
- 
+- Часовой пояс Алии: UTC+5 (Алматы/Астана)
+
 Если клиент хочет записаться — собери по очереди (один вопрос за раз):
 1. Имя
 2. Город или часовой пояс
-3. Удобные дни и время
+3. Конкретную дату и время (например "вторник 15 июля в 14:00") — объясни что нужна конкретная дата
 4. Кратко — с каким запросом обращается
- 
-После того как собрал все 4 пункта — напиши подтверждение и добавь в конце строку:
-ЗАПИСЬ: Имя: {имя} | Город: {город} | Время: {время} | Запрос: {запрос}
- 
+
+После того как собрал все 4 пункта — напиши подтверждение и добавь в конце строку точно в таком формате:
+ЗАПИСЬ: Имя: {имя} | Город: {город} | Дата: {дата в формате ГГГГ-ММ-ДД} | Время: {время в формате ЧЧ:ММ} | Запрос: {запрос}
+
+Пример: ЗАПИСЬ: Имя: Анна | Город: Алматы | Дата: 2026-07-15 | Время: 14:00 | Запрос: тревога
+
 Никогда не обещай гарантированный результат. Не используй "я вас вылечу".
 Пиши на русском, тепло и профессионально. Сообщения короткие — как в реальном чате.
 Не используй маркированные списки со звёздочками или дефисами."""
- 
-# История диалогов в памяти
+
 conversations: dict[str, list] = {}
- 
- 
+
+
+# ───────────────────────── Google Calendar ─────────────────────────
+
+async def get_google_token() -> str:
+    """Получить OAuth токен через JWT для сервисного аккаунта"""
+    import base64
+    import time
+    import json as jsonlib
+
+    header = base64.urlsafe_b64encode(
+        jsonlib.dumps({"alg": "RS256", "typ": "JWT"}).encode()
+    ).rstrip(b"=").decode()
+
+    now = int(time.time())
+    claim = base64.urlsafe_b64encode(
+        jsonlib.dumps({
+            "iss": GOOGLE_SERVICE_ACCOUNT,
+            "scope": "https://www.googleapis.com/auth/calendar",
+            "aud": "https://oauth2.googleapis.com/token",
+            "exp": now + 3600,
+            "iat": now,
+        }).encode()
+    ).rstrip(b"=").decode()
+
+    signing_input = f"{header}.{claim}"
+
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    private_key = serialization.load_pem_private_key(
+        GOOGLE_PRIVATE_KEY.encode(), password=None
+    )
+    signature = private_key.sign(signing_input.encode(), padding.PKCS1v15(), hashes.SHA256())
+    sig_b64 = base64.urlsafe_b64encode(signature).rstrip(b"=").decode()
+    jwt_token = f"{signing_input}.{sig_b64}"
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jwt_token,
+            },
+        )
+        return resp.json()["access_token"]
+
+
+async def create_calendar_event(name: str, date: str, time_str: str, request_text: str, city: str) -> bool:
+    """Создать событие в Google Calendar"""
+    try:
+        token = await get_google_token()
+
+        # Парсим дату и время
+        start_dt = datetime.strptime(f"{date} {time_str}", "%Y-%m-%d %H:%M")
+        end_dt = start_dt + timedelta(hours=1, minutes=30)
+
+        event = {
+            "summary": f"Консультация: {name}",
+            "description": f"Клиент: {name}\nГород: {city}\nЗапрос: {request_text}\n\nЗаписан через бота",
+            "start": {
+                "dateTime": start_dt.strftime("%Y-%m-%dT%H:%M:00"),
+                "timeZone": "Asia/Almaty",
+            },
+            "end": {
+                "dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:00"),
+                "timeZone": "Asia/Almaty",
+            },
+            "reminders": {
+                "useDefault": False,
+                "overrides": [
+                    {"method": "popup", "minutes": 60},
+                    {"method": "email", "minutes": 1440},
+                ],
+            },
+        }
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"https://www.googleapis.com/calendar/v3/calendars/{GOOGLE_CALENDAR_ID}/events",
+                headers={"Authorization": f"Bearer {token}"},
+                json=event,
+            )
+            return resp.status_code == 200
+    except Exception as e:
+        print(f"Calendar error: {e}")
+        return False
+
+
+def parse_booking(line: str) -> dict | None:
+    """Разобрать строку ЗАПИСЬ: в словарь"""
+    try:
+        data = {}
+        parts = line.replace("ЗАПИСЬ:", "").strip().split("|")
+        for part in parts:
+            key, _, val = part.partition(":")
+            data[key.strip().lower()] = val.strip()
+        if all(k in data for k in ["имя", "город", "дата", "время", "запрос"]):
+            return data
+    except Exception:
+        pass
+    return None
+
+
 # ───────────────────────── Claude ─────────────────────────
- 
+
 async def ask_claude(chat_id: str, user_message: str) -> str:
     if chat_id not in conversations:
         conversations[chat_id] = []
- 
+
     conversations[chat_id].append({"role": "user", "content": user_message})
     messages = conversations[chat_id][-20:]
- 
+
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
@@ -69,27 +178,64 @@ async def ask_claude(chat_id: str, user_message: str) -> str:
         )
         data = resp.json()
         reply = data["content"][0]["text"]
- 
+
     conversations[chat_id].append({"role": "assistant", "content": reply})
     return reply
- 
- 
-def extract_booking(reply: str):
-    """Вернуть строку ЗАПИСЬ: если она есть, иначе None"""
+
+
+def extract_booking_line(reply: str) -> str | None:
     for line in reply.split("\n"):
         if line.startswith("ЗАПИСЬ:"):
             return line
     return None
- 
- 
+
+
+async def process_reply(reply: str, source: str, contact: str) -> str:
+    """Обработать ответ: записать в календарь и уведомить Алию"""
+    booking_line = extract_booking_line(reply)
+    if not booking_line:
+        return reply
+
+    booking = parse_booking(booking_line)
+    clean_reply = reply.replace(booking_line, "").strip()
+
+    if booking and GOOGLE_CALENDAR_ID:
+        success = await create_calendar_event(
+            name=booking["имя"],
+            date=booking["дата"],
+            time_str=booking["время"],
+            request_text=booking["запрос"],
+            city=booking["город"],
+        )
+        if success:
+            print(f"✅ Событие создано в календаре: {booking}")
+        else:
+            print(f"❌ Ошибка создания события: {booking}")
+
+    # Уведомить Алию в WhatsApp
+    if PSYCHOLOGIST_PHONE:
+        notify = (
+            f"📋 Новая запись через {source}!\n\n"
+            f"Клиент: {booking.get('имя', '?')}\n"
+            f"Город: {booking.get('город', '?')}\n"
+            f"Дата: {booking.get('дата', '?')} в {booking.get('время', '?')}\n"
+            f"Запрос: {booking.get('запрос', '?')}\n"
+            f"Контакт: {contact}\n\n"
+            f"✅ Событие добавлено в Google Calendar"
+        )
+        await send_whatsapp(PSYCHOLOGIST_PHONE + "@c.us", notify)
+
+    return clean_reply
+
+
 # ───────────────────────── WhatsApp ─────────────────────────
- 
+
 async def send_whatsapp(chat_id: str, message: str):
     url = f"https://api.green-api.com/waInstance{GREEN_API_ID}/sendMessage/{GREEN_API_TOKEN}"
     async with httpx.AsyncClient(timeout=30) as client:
         await client.post(url, json={"chatId": chat_id, "message": message})
- 
- 
+
+
 async def handle_whatsapp(body: dict):
     if body.get("typeWebhook") != "incomingMessageReceived":
         return
@@ -100,27 +246,21 @@ async def handle_whatsapp(body: dict):
     chat_id = body.get("senderData", {}).get("chatId", "")
     if not text or not chat_id or "@g.us" in chat_id:
         return
- 
+
+    phone = chat_id.replace("@c.us", "")
     reply = await ask_claude(f"wa:{chat_id}", text)
-    booking = extract_booking(reply)
- 
-    if booking and PSYCHOLOGIST_PHONE:
-        phone = chat_id.replace("@c.us", "")
-        notify = f"📋 Новая запись!\n\nКлиент из WhatsApp (+{phone}):\n{booking}"
-        await send_whatsapp(PSYCHOLOGIST_PHONE + "@c.us", notify)
-        reply = reply.replace(booking, "").strip()
- 
+    reply = await process_reply(reply, "WhatsApp", f"+{phone}")
     await send_whatsapp(chat_id, reply)
- 
- 
+
+
 # ───────────────────────── Telegram ─────────────────────────
- 
+
 async def send_telegram(chat_id: int, text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     async with httpx.AsyncClient(timeout=30) as client:
         await client.post(url, json={"chat_id": chat_id, "text": text})
- 
- 
+
+
 async def handle_telegram(body: dict):
     message = body.get("message") or body.get("edited_message")
     if not message:
@@ -129,50 +269,45 @@ async def handle_telegram(body: dict):
     chat_id = message.get("chat", {}).get("id")
     if not text or not chat_id:
         return
- 
-    # Приветствие на /start
+
     if text == "/start":
         text = "Здравствуйте! Хочу узнать подробнее о консультациях."
- 
+
+    username = message.get("from", {}).get("username", "")
+    name = message.get("from", {}).get("first_name", "")
+    contact = f"@{username}" if username else name
+
     reply = await ask_claude(f"tg:{chat_id}", text)
-    booking = extract_booking(reply)
- 
-    if booking and PSYCHOLOGIST_PHONE:
-        username = message.get("from", {}).get("username", "")
-        name = message.get("from", {}).get("first_name", "")
-        notify = f"📋 Новая запись!\n\nКлиент из Telegram (@{username} / {name}):\n{booking}"
-        await send_whatsapp(PSYCHOLOGIST_PHONE + "@c.us", notify)
-        reply = reply.replace(booking, "").strip()
- 
+    reply = await process_reply(reply, "Telegram", contact)
     await send_telegram(chat_id, reply)
- 
- 
-# ───────────────────────── Startup: регистрация вебхука ─────────────────────────
- 
+
+
+# ───────────────────────── Startup ─────────────────────────
+
 async def set_telegram_webhook():
     if not TELEGRAM_TOKEN:
         return
-    railway_url = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
-    if not railway_url:
-        print("RAILWAY_PUBLIC_DOMAIN не задан, вебхук Telegram не установлен")
+    domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+    if not domain:
         return
-    webhook_url = f"https://{railway_url}/telegram"
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(url, json={"url": webhook_url})
+        resp = await client.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
+            json={"url": f"https://{domain}/telegram"},
+        )
         print(f"Telegram webhook: {resp.json()}")
- 
- 
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await set_telegram_webhook()
     yield
- 
+
 app = FastAPI(lifespan=lifespan)
- 
- 
-# ───────────────────────── Роуты ─────────────────────────
- 
+
+
+# ───────────────────────── Routes ─────────────────────────
+
 @app.post("/webhook")
 async def whatsapp_webhook(request: Request):
     try:
@@ -181,8 +316,8 @@ async def whatsapp_webhook(request: Request):
     except Exception as e:
         print(f"WhatsApp error: {e}")
     return JSONResponse({"status": "ok"})
- 
- 
+
+
 @app.post("/telegram")
 async def telegram_webhook(request: Request):
     try:
@@ -191,13 +326,14 @@ async def telegram_webhook(request: Request):
     except Exception as e:
         print(f"Telegram error: {e}")
     return JSONResponse({"status": "ok"})
- 
- 
+
+
 @app.get("/")
 async def root():
-    return {"status": "Бот Алии работает — WhatsApp + Telegram ✅"}
- 
- 
+    return {"status": "Бот Алии работает — WhatsApp + Telegram + Google Calendar ✅"}
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
