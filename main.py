@@ -11,11 +11,18 @@ GREEN_API_ID = os.environ["GREEN_API_ID"]
 GREEN_API_TOKEN = os.environ["GREEN_API_TOKEN"]
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 PSYCHOLOGIST_PHONE = os.environ.get("PSYCHOLOGIST_PHONE", "")
-GOOGLE_SERVICE_ACCOUNT = os.environ.get("GOOGLE_SERVICE_ACCOUNT", "")
-GOOGLE_PRIVATE_KEY = os.environ.get("GOOGLE_PRIVATE_KEY", "").replace("\\n", "\n")
 GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "")
 
-SYSTEM_PROMPT = """Ты — ассистент психолога Алии. Ты не проводишь терапию, не ставишь диагнозы, не даёшь медицинских назначений.
+# Читаем Google credentials из одного JSON
+_creds_raw = os.environ.get("GOOGLE_CREDENTIALS", "{}")
+try:
+    GOOGLE_CREDS = json.loads(_creds_raw)
+except Exception:
+    GOOGLE_CREDS = {}
+
+CURRENT_YEAR = datetime.now().year
+
+SYSTEM_PROMPT = f"""Ты — ассистент психолога Алии. Ты не проводишь терапию, не ставишь диагнозы, не даёшь медицинских назначений.
 
 Твои задачи:
 1. Вежливо приветствовать и отвечать на вопросы
@@ -32,16 +39,18 @@ SYSTEM_PROMPT = """Ты — ассистент психолога Алии. Ты
 - Работает с: тревогой, эмоциональной регуляцией, отношениями, самооценкой, стрессом
 - Часовой пояс Алии: UTC+5 (Алматы/Астана)
 
+Текущий год: {CURRENT_YEAR}. Все даты записи должны быть в {CURRENT_YEAR} году или позже.
+
 Если клиент хочет записаться — собери по очереди (один вопрос за раз):
 1. Имя
 2. Город или часовой пояс
-3. Конкретную дату и время (например "вторник 15 июля в 14:00") — объясни что нужна конкретная дата
+3. Конкретную дату и время (например "15 июля в 14:00") — уточни что нужна конкретная дата в {CURRENT_YEAR} году
 4. Кратко — с каким запросом обращается
 
 После того как собрал все 4 пункта — напиши подтверждение и добавь в конце строку точно в таком формате:
-ЗАПИСЬ: Имя: {имя} | Город: {город} | Дата: {дата в формате ГГГГ-ММ-ДД} | Время: {время в формате ЧЧ:ММ} | Запрос: {запрос}
+ЗАПИСЬ: Имя: {{имя}} | Город: {{город}} | Дата: {{дата в формате ГГГГ-ММ-ДД}} | Время: {{время в формате ЧЧ:ММ}} | Запрос: {{запрос}}
 
-Пример: ЗАПИСЬ: Имя: Анна | Город: Алматы | Дата: 2026-07-15 | Время: 14:00 | Запрос: тревога
+Пример: ЗАПИСЬ: Имя: Анна | Город: Алматы | Дата: {CURRENT_YEAR}-07-15 | Время: 14:00 | Запрос: тревога
 
 Никогда не обещай гарантированный результат. Не используй "я вас вылечу".
 Пиши на русском, тепло и профессионально. Сообщения короткие — как в реальном чате.
@@ -53,19 +62,23 @@ conversations: dict[str, list] = {}
 # ───────────────────────── Google Calendar ─────────────────────────
 
 async def get_google_token() -> str:
-    """Получить OAuth токен через JWT для сервисного аккаунта"""
     import base64
     import time
-    import json as jsonlib
+
+    if not GOOGLE_CREDS:
+        raise Exception("GOOGLE_CREDENTIALS не настроены")
+
+    service_account = GOOGLE_CREDS.get("client_email", "")
+    private_key = GOOGLE_CREDS.get("private_key", "")
 
     header = base64.urlsafe_b64encode(
-        jsonlib.dumps({"alg": "RS256", "typ": "JWT"}).encode()
+        json.dumps({"alg": "RS256", "typ": "JWT"}).encode()
     ).rstrip(b"=").decode()
 
     now = int(time.time())
     claim = base64.urlsafe_b64encode(
-        jsonlib.dumps({
-            "iss": GOOGLE_SERVICE_ACCOUNT,
+        json.dumps({
+            "iss": service_account,
             "scope": "https://www.googleapis.com/auth/calendar",
             "aud": "https://oauth2.googleapis.com/token",
             "exp": now + 3600,
@@ -78,10 +91,12 @@ async def get_google_token() -> str:
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
 
-    private_key = serialization.load_pem_private_key(
-        GOOGLE_PRIVATE_KEY.encode(), password=None
+    private_key_obj = serialization.load_pem_private_key(
+        private_key.encode(), password=None
     )
-    signature = private_key.sign(signing_input.encode(), padding.PKCS1v15(), hashes.SHA256())
+    signature = private_key_obj.sign(
+        signing_input.encode(), padding.PKCS1v15(), hashes.SHA256()
+    )
     sig_b64 = base64.urlsafe_b64encode(signature).rstrip(b"=").decode()
     jwt_token = f"{signing_input}.{sig_b64}"
 
@@ -93,29 +108,23 @@ async def get_google_token() -> str:
                 "assertion": jwt_token,
             },
         )
-        return resp.json()["access_token"]
+        data = resp.json()
+        if "access_token" not in data:
+            raise Exception(f"Token error: {data}")
+        return data["access_token"]
 
 
 async def create_calendar_event(name: str, date: str, time_str: str, request_text: str, city: str) -> bool:
-    """Создать событие в Google Calendar"""
     try:
         token = await get_google_token()
-
-        # Парсим дату и время
         start_dt = datetime.strptime(f"{date} {time_str}", "%Y-%m-%d %H:%M")
         end_dt = start_dt + timedelta(hours=1, minutes=30)
 
         event = {
             "summary": f"Консультация: {name}",
             "description": f"Клиент: {name}\nГород: {city}\nЗапрос: {request_text}\n\nЗаписан через бота",
-            "start": {
-                "dateTime": start_dt.strftime("%Y-%m-%dT%H:%M:00"),
-                "timeZone": "Asia/Almaty",
-            },
-            "end": {
-                "dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:00"),
-                "timeZone": "Asia/Almaty",
-            },
+            "start": {"dateTime": start_dt.strftime("%Y-%m-%dT%H:%M:00"), "timeZone": "Asia/Almaty"},
+            "end": {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:00"), "timeZone": "Asia/Almaty"},
             "reminders": {
                 "useDefault": False,
                 "overrides": [
@@ -131,14 +140,18 @@ async def create_calendar_event(name: str, date: str, time_str: str, request_tex
                 headers={"Authorization": f"Bearer {token}"},
                 json=event,
             )
-            return resp.status_code == 200
+            if resp.status_code == 200:
+                print(f"✅ Событие создано: {name} {date} {time_str}")
+                return True
+            else:
+                print(f"❌ Calendar API error {resp.status_code}: {resp.text}")
+                return False
     except Exception as e:
-        print(f"Calendar error: {e}")
+        print(f"❌ Ошибка создания события: {e}")
         return False
 
 
 def parse_booking(line: str) -> dict | None:
-    """Разобрать строку ЗАПИСЬ: в словарь"""
     try:
         data = {}
         parts = line.replace("ЗАПИСЬ:", "").strip().split("|")
@@ -146,6 +159,11 @@ def parse_booking(line: str) -> dict | None:
             key, _, val = part.partition(":")
             data[key.strip().lower()] = val.strip()
         if all(k in data for k in ["имя", "город", "дата", "время", "запрос"]):
+            # Исправляем год если бот поставил прошлый
+            if "дата" in data:
+                parts_date = data["дата"].split("-")
+                if len(parts_date) == 3 and int(parts_date[0]) < CURRENT_YEAR:
+                    data["дата"] = f"{CURRENT_YEAR}-{parts_date[1]}-{parts_date[2]}"
             return data
     except Exception:
         pass
@@ -157,7 +175,6 @@ def parse_booking(line: str) -> dict | None:
 async def ask_claude(chat_id: str, user_message: str) -> str:
     if chat_id not in conversations:
         conversations[chat_id] = []
-
     conversations[chat_id].append({"role": "user", "content": user_message})
     messages = conversations[chat_id][-20:]
 
@@ -191,7 +208,6 @@ def extract_booking_line(reply: str) -> str | None:
 
 
 async def process_reply(reply: str, source: str, contact: str) -> str:
-    """Обработать ответ: записать в календарь и уведомить Алию"""
     booking_line = extract_booking_line(reply)
     if not booking_line:
         return reply
@@ -199,29 +215,29 @@ async def process_reply(reply: str, source: str, contact: str) -> str:
     booking = parse_booking(booking_line)
     clean_reply = reply.replace(booking_line, "").strip()
 
-    if booking and GOOGLE_CALENDAR_ID:
-        success = await create_calendar_event(
+    if not booking:
+        return clean_reply
+
+    calendar_ok = False
+    if GOOGLE_CALENDAR_ID and GOOGLE_CREDS:
+        calendar_ok = await create_calendar_event(
             name=booking["имя"],
             date=booking["дата"],
             time_str=booking["время"],
             request_text=booking["запрос"],
             city=booking["город"],
         )
-        if success:
-            print(f"✅ Событие создано в календаре: {booking}")
-        else:
-            print(f"❌ Ошибка создания события: {booking}")
 
-    # Уведомить Алию в WhatsApp
     if PSYCHOLOGIST_PHONE:
+        cal_status = "✅ Добавлено в Google Calendar" if calendar_ok else "⚠️ Календарь — добавьте вручную"
         notify = (
             f"📋 Новая запись через {source}!\n\n"
-            f"Клиент: {booking.get('имя', '?')}\n"
-            f"Город: {booking.get('город', '?')}\n"
-            f"Дата: {booking.get('дата', '?')} в {booking.get('время', '?')}\n"
-            f"Запрос: {booking.get('запрос', '?')}\n"
+            f"Клиент: {booking.get('имя')}\n"
+            f"Город: {booking.get('город')}\n"
+            f"Дата: {booking.get('дата')} в {booking.get('время')}\n"
+            f"Запрос: {booking.get('запрос')}\n"
             f"Контакт: {contact}\n\n"
-            f"✅ Событие добавлено в Google Calendar"
+            f"{cal_status}"
         )
         await send_whatsapp(PSYCHOLOGIST_PHONE + "@c.us", notify)
 
@@ -330,10 +346,9 @@ async def telegram_webhook(request: Request):
 
 @app.get("/")
 async def root():
-    return {"status": "Бот Алии работает — WhatsApp + Telegram + Google Calendar ✅"}
+    return {"status": f"Бот Алии работает — WhatsApp + Telegram + Google Calendar ✅ (год: {CURRENT_YEAR})"}
 
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
-
