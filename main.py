@@ -190,9 +190,11 @@ async def check_slot(date: str, time_str: str) -> tuple[bool, list[str]]:
     if any(overlaps(bs, be) for bs, be in busy):
         # Ищем свободные слоты — шаг 30 минут для точности предложений
         before, after = [], []
-        for mins in range(WORK_START, WORK_END - SESSION_BLOCK + 1, 60):
+        for mins in range(WORK_START, WORK_END - SESSION_BLOCK + 1, 30):
             if slot_free(mins):
-                label = f"{mins // 60:02d}:{mins % 60:02d}"
+                if mins % 60 != 0:
+                    continue
+                label = f"{mins // 60:02d}:00"
                 if mins + SESSION_BLOCK <= req_start:
                     before.append(label)
                 elif mins >= req_end + SESSION_BLOCK:
