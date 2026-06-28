@@ -226,23 +226,79 @@ async def ask_claude(chat_id: str, user_message: str) -> str:
     return reply
 
 
-def extract_booking_line(reply: str) -> str | None:
+async def extract_booking_from_reply(reply: str) -> dict | None:
+    """Сначала ищем строку ЗАПИСЬ:, если нет — используем Claude для извлечения данных"""
+    # Попытка 1: стандартный формат
     for line in reply.split("\n"):
         if line.startswith("ЗАПИСЬ:"):
-            return line
-    return None
+            result = parse_booking(line)
+            if result:
+                return result
+
+    # Попытка 2: извлечь через Claude если есть ключевые слова подтверждения
+    keywords = ["подтверждаю", "записал", "записала", "запись", "консультаци"]
+    if not any(k in reply.lower() for k in keywords):
+        return None
+
+    now = datetime.utcnow() + timedelta(hours=5)
+    extract_prompt = f"""Из текста ниже извлеки данные о записи клиента к психологу.
+Сегодня: {now.strftime('%Y-%m-%d')}.
+Верни ТОЛЬКО JSON без пояснений:
+{{"имя": "...", "город": "...", "дата": "ГГГГ-ММ-ДД", "время": "ЧЧ:ММ", "запрос": "..."}}
+Время должно быть по Астане (UTC+5). Если данных нет — верни null.
+
+Текст:
+{reply}"""
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 200,
+                    "messages": [{"role": "user", "content": extract_prompt}],
+                },
+            )
+            text = resp.json()["content"][0]["text"].strip()
+            if text == "null":
+                return None
+            data = json.loads(text)
+            # Исправляем год если нужно
+            if data.get("дата"):
+                import re
+                m = re.match(r"(\d{4})-(\d{2})-(\d{2})", data["дата"])
+                if m and int(m.group(1)) < now.year:
+                    data["дата"] = f"{now.year}-{m.group(2)}-{m.group(3)}"
+            # Очищаем время
+            if data.get("время"):
+                import re
+                t = re.search(r"\d{1,2}:\d{2}", data["время"])
+                if t:
+                    data["время"] = t.group(0).zfill(5)
+            print(f"✅ Данные извлечены через Claude: {data}")
+            return data
+    except Exception as e:
+        print(f"❌ Ошибка извлечения данных: {e}")
+        return None
 
 
 async def process_reply(reply: str, source: str, contact: str) -> str:
-    booking_line = extract_booking_line(reply)
-    if not booking_line:
+    booking = await extract_booking_from_reply(reply)
+    if not booking:
         return reply
 
-    booking = parse_booking(booking_line)
-    clean_reply = reply.replace(booking_line, "").strip()
-
-    if not booking:
-        return clean_reply
+    clean_reply = reply
+    # Убираем строку ЗАПИСЬ: если она есть
+    for line in reply.split("\n"):
+        if line.startswith("ЗАПИСЬ:"):
+            clean_reply = reply.replace(line, "").strip()
+            break
 
     calendar_ok = False
     if GOOGLE_CALENDAR_ID and GOOGLE_CREDS:
@@ -378,3 +434,4 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
