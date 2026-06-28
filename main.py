@@ -195,7 +195,7 @@ async def check_slot(date: str, time_str: str) -> tuple[bool, list[str]]:
                 if mins % 60 != 0:
                     continue
                 label = f"{mins // 60:02d}:00"
-                if mins + SESSION_BLOCK <= req_start:
+                if mins < req_start and slot_free(mins):
                     before.append(label)
                 elif mins >= req_end + SESSION_BLOCK:
                     after.append(label)
