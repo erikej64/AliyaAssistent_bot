@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import httpx
 from datetime import datetime, timedelta
@@ -21,12 +22,22 @@ except Exception:
 
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
+# Длительность блока: 1.5ч сеанс + 0.5ч обработка = 2 часа = 120 минут
+SESSION_BLOCK = 120
+WORK_START = 10 * 60   # 10:00
+WORK_END   = 21 * 60   # 21:00
+
+
+def now_astana() -> datetime:
+    return datetime.utcnow() + timedelta(hours=5)
+
+
 def get_system_prompt() -> str:
-    now = datetime.utcnow() + timedelta(hours=5)  # Астана UTC+5 (не меняется, нет летнего времени)
+    now = now_astana()
     today_str = now.strftime("%d.%m.%Y")
-    tomorrow = (now + timedelta(days=1)).strftime("%d.%m.%Y")
+    tomorrow  = (now + timedelta(days=1)).strftime("%d.%m.%Y")
     day_after = (now + timedelta(days=2)).strftime("%d.%m.%Y")
-    weekday = WEEKDAYS[now.weekday()]
+    weekday   = WEEKDAYS[now.weekday()]
     current_time = now.strftime("%H:%M")
     year = now.year
 
@@ -45,7 +56,7 @@ def get_system_prompt() -> str:
 - Пакет: 10 сессий — 200 000 тенге
 - Методы: ACT, КПТ (CBT), DBT
 - Работает с: тревогой, эмоциональной регуляцией, отношениями, самооценкой, стрессом
-- Алия работает по времени Астаны (UTC+5)
+- Алия работает по времени Астаны (UTC+5), с 10:00 до 21:00
 
 ТЕКУЩАЯ ДАТА И ВРЕМЯ (Астана UTC+5):
 - Сегодня: {today_str} ({weekday}), {current_time}
@@ -63,18 +74,18 @@ def get_system_prompt() -> str:
 3. Дату и время — переведи в UTC+5 (Астана). Новосибирск UTC+7: 15:00 = 13:00 Астана. Москва UTC+3: 15:00 = 17:00 Астана. Казахстан — время не меняй.
 4. Кратко — с каким запросом обращается
 
-После сбора всех 4 пунктов — напиши клиенту короткое подтверждение, и ОБЯЗАТЕЛЬНО в конце сообщения добавь служебную строку в точно таком формате (без изменений структуры):
+После сбора всех 4 пунктов — напиши клиенту короткое подтверждение и ОБЯЗАТЕЛЬНО добавь последней строкой:
 ЗАПИСЬ: Имя: {{имя}} | Город: {{город}} | Дата: {{ГГГГ-ММ-ДД}} | Время: {{ЧЧ:ММ}} | Запрос: {{запрос}}
 
 ВАЖНО для строки ЗАПИСЬ:
-- Дата всегда в формате ГГГГ-ММ-ДД (например 2026-06-28)
-- Время только цифры ЧЧ:ММ по Астане, без слов (например 19:00)
-- Строка ЗАПИСЬ должна быть последней строкой сообщения
-- Без этой строки запись не сохранится в календарь!
+- Дата в формате ГГГГ-ММ-ДД (например {year}-07-15)
+- Время только цифры ЧЧ:ММ по Астане (например 14:00)
+- Строка ЗАПИСЬ — последняя строка, без неё запись не сохранится!
 
 Никогда не обещай гарантированный результат. Не используй "я вас вылечу".
 Пиши на русском, тепло и профессионально. Сообщения короткие — как в реальном чате.
 Не используй маркированные списки со звёздочками или дефисами."""
+
 
 conversations: dict[str, list] = {}
 
@@ -82,19 +93,19 @@ conversations: dict[str, list] = {}
 # ───────────────────────── Google Calendar ─────────────────────────
 
 async def get_google_token() -> str:
-    import base64, time
+    import base64, time as _time
 
     if not GOOGLE_CREDS:
         raise Exception("GOOGLE_CREDENTIALS не настроены")
 
     service_account = GOOGLE_CREDS.get("client_email", "")
-    private_key = GOOGLE_CREDS.get("private_key", "")
+    private_key     = GOOGLE_CREDS.get("private_key", "")
 
     header = base64.urlsafe_b64encode(
         json.dumps({"alg": "RS256", "typ": "JWT"}).encode()
     ).rstrip(b"=").decode()
 
-    now = int(time.time())
+    now = int(_time.time())
     claim = base64.urlsafe_b64encode(
         json.dumps({
             "iss": service_account,
@@ -110,8 +121,8 @@ async def get_google_token() -> str:
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
 
-    private_key_obj = serialization.load_pem_private_key(private_key.encode(), password=None)
-    signature = private_key_obj.sign(signing_input.encode(), padding.PKCS1v15(), hashes.SHA256())
+    pk = serialization.load_pem_private_key(private_key.encode(), password=None)
+    signature = pk.sign(signing_input.encode(), padding.PKCS1v15(), hashes.SHA256())
     sig_b64 = base64.urlsafe_b64encode(signature).rstrip(b"=").decode()
     jwt_token = f"{signing_input}.{sig_b64}"
 
@@ -125,21 +136,18 @@ async def get_google_token() -> str:
             raise Exception(f"Token error: {data}")
         return data["access_token"]
 
-async def get_busy_slots(date: str) -> list[tuple[str, str]]:
-    """Получить занятые слоты на дату (возвращает список (начало, конец) по Астане)"""
+
+async def get_busy_slots(date: str) -> list[tuple[int, int]]:
+    """Возвращает список занятых интервалов (start_min, end_min) по Астане."""
     try:
         token = await get_google_token()
-        # Начало и конец дня в UTC (Астана UTC+5, значит -5 часов)
-        day_start = f"{date}T00:00:00+05:00"
-        day_end = f"{date}T23:59:59+05:00"
-
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
                 f"https://www.googleapis.com/calendar/v3/calendars/{GOOGLE_CALENDAR_ID}/events",
                 headers={"Authorization": f"Bearer {token}"},
                 params={
-                    "timeMin": day_start,
-                    "timeMax": day_end,
+                    "timeMin": f"{date}T00:00:00+05:00",
+                    "timeMax": f"{date}T23:59:59+05:00",
                     "singleEvents": "true",
                     "orderBy": "startTime",
                 },
@@ -147,13 +155,12 @@ async def get_busy_slots(date: str) -> list[tuple[str, str]]:
             events = resp.json().get("items", [])
             slots = []
             for e in events:
-                start = e.get("start", {}).get("dateTime", "")
-                end = e.get("end", {}).get("dateTime", "")
-                if start and end:
-                    # Берём только ЧЧ:ММ
-                    s = start[11:16]
-                    en = end[11:16]
-                    slots.append((s, en))
+                s = e.get("start", {}).get("dateTime", "")
+                en = e.get("end",   {}).get("dateTime", "")
+                if s and en:
+                    sh, sm = int(s[11:13]), int(s[14:16])
+                    eh, em = int(en[11:13]), int(en[14:16])
+                    slots.append((sh * 60 + sm, eh * 60 + em))
             print(f"Занятые слоты на {date}: {slots}")
             return slots
     except Exception as e:
@@ -161,63 +168,58 @@ async def get_busy_slots(date: str) -> list[tuple[str, str]]:
         return []
 
 
-async def is_slot_free(date: str, time_str: str) -> tuple[bool, list[str]]:
-    """Проверить свободен ли слот. Возвращает (свободен, список свободных часов дня)"""
+async def check_slot(date: str, time_str: str) -> tuple[bool, list[str]]:
+    """Проверить слот. Возвращает (свободен, [до, после]) — 2 ближайших свободных."""
     busy = await get_busy_slots(date)
-    
-    # Время начала и конца новой записи
-    try:
-        h, m = map(int, time_str.split(":"))
-        new_start = h * 60 + m
-        new_end = new_start + 90  # 1.5 часа
-    except:
-        return True, []
 
-    # Проверяем пересечение
-    for (s, e) in busy:
-        try:
-            sh, sm = map(int, s.split(":"))
-            eh, em = map(int, e.split(":"))
-            busy_start = sh * 60 + sm
-            busy_end = eh * 60 + em
-            if new_start < busy_end and new_end > busy_start:
-                # Слот занят — найдём свободные часы
-                free = []
-                for hour in range(9, 21):  # с 9:00 до 21:00
-                    slot_start = hour * 60
-                    slot_end = slot_start + 90
-                    free_slot = True
-                    for (bs, be) in busy:
-                        bsh, bsm = map(int, bs.split(":"))
-                        beh, bem = map(int, be.split(":"))
-                        bs_min = bsh * 60 + bsm
-                        be_min = beh * 60 + bem
-                        if slot_start < be_min and slot_end > bs_min:
-                            free_slot = False
-                            break
-                    if free_slot:
-                        free.append(f"{hour:02d}:00")
-                return False, free
-        except:
-            continue
-    
+    h, m = map(int, time_str.split(":"))
+    req_start = h * 60 + m
+    req_end   = req_start + SESSION_BLOCK  # занимаем 120 минут
+
+    def overlaps(s: int, e: int) -> bool:
+        return s < req_end and e > req_start
+
+    def slot_free(s: int) -> bool:
+        se = s + SESSION_BLOCK
+        for bs, be in busy:
+            if s < be and se > bs:
+                return False
+        return True
+
+    # Проверяем запрошенный слот
+    if any(overlaps(bs, be) for bs, be in busy):
+        # Ищем свободные слоты — шаг 30 минут для точности предложений
+        before, after = [], []
+        for mins in range(WORK_START, WORK_END - SESSION_BLOCK + 1, 30):
+            if slot_free(mins):
+                label = f"{mins // 60:02d}:{mins % 60:02d}"
+                if mins + SESSION_BLOCK <= req_start:
+                    before.append(label)
+                elif mins >= req_end:
+                    after.append(label)
+
+        suggestions = []
+        if before:
+            suggestions.append(before[-1])   # ближайший ДО
+        if after:
+            suggestions.append(after[0])     # ближайший ПОСЛЕ
+
+        return False, suggestions
+
     return True, []
+
+
 async def create_calendar_event(name: str, date: str, time_str: str, request_text: str, city: str) -> bool:
     try:
         token = await get_google_token()
         start_dt = datetime.strptime(f"{date} {time_str}", "%Y-%m-%d %H:%M")
-        end_dt = start_dt + timedelta(hours=1, minutes=30)
-
-        title = f"Консультация: {name}" if name else "Консультация"
+        end_dt   = start_dt + timedelta(hours=1, minutes=30)  # длина сеанса 1.5ч
 
         event = {
-            "summary": title,
+            "summary": f"Консультация: {name}" if name else "Консультация",
             "description": (
-                f"Клиент: {name}\n"
-                f"Город: {city}\n"
-                f"Запрос: {request_text}\n"
-                f"Время указано по Астане (UTC+5)\n\n"
-                f"Записан через бота"
+                f"Клиент: {name}\nГород: {city}\nЗапрос: {request_text}\n"
+                f"Время по Астане (UTC+5)\nЗаписан через бота"
             ),
             "start": {"dateTime": start_dt.strftime("%Y-%m-%dT%H:%M:00"), "timeZone": "Asia/Almaty"},
             "end":   {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:00"),   "timeZone": "Asia/Almaty"},
@@ -237,8 +239,7 @@ async def create_calendar_event(name: str, date: str, time_str: str, request_tex
                 json=event,
             )
             if resp.status_code in (200, 201):
-                result = resp.json()
-                print(f"✅ Событие создано: {result.get('summary')} {date} {time_str} (Астана)")
+                print(f"✅ Событие создано: {name} {date} {time_str}")
                 return True
             else:
                 print(f"❌ Calendar API error {resp.status_code}: {resp.text}")
@@ -248,27 +249,89 @@ async def create_calendar_event(name: str, date: str, time_str: str, request_tex
         return False
 
 
-def parse_booking(line: str) -> dict | None:
+# ───────────────────────── Парсинг данных записи ─────────────────────────
+
+def parse_booking_line(line: str) -> dict | None:
     try:
-        import re
         data = {}
         parts = line.replace("ЗАПИСЬ:", "").strip().split("|")
         for part in parts:
             key, _, val = part.partition(":")
             data[key.strip().lower()] = val.strip()
-        if all(k in data for k in ["имя", "город", "дата", "время", "запрос"]):
-            # Исправляем год если нужно
-            date_parts = data["дата"].split("-")
-            if len(date_parts) == 3 and int(date_parts[0]) < CURRENT_YEAR:
-                data["дата"] = f"{CURRENT_YEAR}-{date_parts[1]}-{date_parts[2]}"
-            # Вытаскиваем только ЧЧ:ММ из поля времени (убираем "по Астане" и прочее)
-            time_match = re.search(r"\d{1,2}:\d{2}", data["время"])
-            if time_match:
-                data["время"] = time_match.group(0).zfill(5)
-            return data
+        if not all(k in data for k in ["имя", "город", "дата", "время", "запрос"]):
+            return None
+        # Исправляем год
+        dp = data["дата"].split("-")
+        if len(dp) == 3 and int(dp[0]) < now_astana().year:
+            data["дата"] = f"{now_astana().year}-{dp[1]}-{dp[2]}"
+        # Очищаем время
+        t = re.search(r"\d{1,2}:\d{2}", data["время"])
+        if t:
+            data["время"] = t.group(0).zfill(5)
+        return data
     except Exception:
-        pass
-    return None
+        return None
+
+
+async def extract_booking(reply: str) -> dict | None:
+    # Попытка 1: строка ЗАПИСЬ:
+    for line in reply.split("\n"):
+        if line.startswith("ЗАПИСЬ:"):
+            result = parse_booking_line(line)
+            if result:
+                return result
+
+    # Попытка 2: Claude извлекает из текста
+    keywords = ["подтверждаю", "записал", "записала", "запись", "консультаци"]
+    if not any(k in reply.lower() for k in keywords):
+        return None
+
+    now = now_astana()
+    prompt = f"""Из текста извлеки данные о записи клиента к психологу.
+Сегодня: {now.strftime('%Y-%m-%d')}.
+Верни ТОЛЬКО JSON (без markdown, без пояснений):
+{{"имя": "...", "город": "...", "дата": "ГГГГ-ММ-ДД", "время": "ЧЧ:ММ", "запрос": "..."}}
+Если данных нет — верни null.
+
+Текст:
+{reply}"""
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 200,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+            )
+            text = resp.json()["content"][0]["text"].strip()
+            print(f"EXTRACT RAW: {text[:300]}")
+            text = text.replace("```json", "").replace("```", "").strip()
+            if not text or text == "null":
+                return None
+            data = json.loads(text)
+            # Исправляем год
+            if data.get("дата"):
+                m2 = re.match(r"(\d{4})-(\d{2})-(\d{2})", data["дата"])
+                if m2 and int(m2.group(1)) < now.year:
+                    data["дата"] = f"{now.year}-{m2.group(2)}-{m2.group(3)}"
+            # Очищаем время
+            if data.get("время"):
+                t2 = re.search(r"\d{1,2}:\d{2}", data["время"])
+                if t2:
+                    data["время"] = t2.group(0).zfill(5)
+            print(f"✅ Данные извлечены: {data}")
+            return data
+    except Exception as e:
+        print(f"❌ Ошибка извлечения: {e}")
+        return None
 
 
 # ───────────────────────── Claude ─────────────────────────
@@ -294,111 +357,45 @@ async def ask_claude(chat_id: str, user_message: str) -> str:
                 "messages": messages,
             },
         )
-        data = resp.json()
-        reply = data["content"][0]["text"]
+        reply = resp.json()["content"][0]["text"]
 
     conversations[chat_id].append({"role": "assistant", "content": reply})
     print(f"BOT REPLY [{chat_id}]: {reply[:200]}")
     return reply
 
 
-async def extract_booking_from_reply(reply: str) -> dict | None:
-    """Сначала ищем строку ЗАПИСЬ:, если нет — используем Claude для извлечения данных"""
-    # Попытка 1: стандартный формат
-    for line in reply.split("\n"):
-        if line.startswith("ЗАПИСЬ:"):
-            result = parse_booking(line)
-            if result:
-                return result
-
-    # Попытка 2: извлечь через Claude если есть ключевые слова подтверждения
-    keywords = ["подтверждаю", "записал", "записала", "запись", "консультаци"]
-    if not any(k in reply.lower() for k in keywords):
-        return None
-
-    now = datetime.utcnow() + timedelta(hours=5)
-    extract_prompt = f"""Из текста ниже извлеки данные о записи клиента к психологу.
-Сегодня: {now.strftime('%Y-%m-%d')}.
-Верни ТОЛЬКО JSON без пояснений:
-{{"имя": "...", "город": "...", "дата": "ГГГГ-ММ-ДД", "время": "ЧЧ:ММ", "запрос": "..."}}
-Время должно быть по Астане (UTC+5). Если данных нет — верни null.
-
-Текст:
-{reply}"""
-
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": "claude-sonnet-4-6",
-                    "max_tokens": 200,
-                    "messages": [{"role": "user", "content": extract_prompt}],
-                },
-            )
-            text = resp.json()["content"][0]["text"].strip()
-            print(f"EXTRACT RAW: {text[:300]}")
-            if not text or text == "null":
-                return None
-            text = text.replace("```json", "").replace("```", "").strip()
-            if not text or text == "null":
-                return None
-            data = json.loads(text)
-            # Исправляем год если нужно
-            if data.get("дата"):
-                import re
-                m = re.match(r"(\d{4})-(\d{2})-(\d{2})", data["дата"])
-                if m and int(m.group(1)) < now.year:
-                    data["дата"] = f"{now.year}-{m.group(2)}-{m.group(3)}"
-            # Очищаем время
-            if data.get("время"):
-                import re
-                t = re.search(r"\d{1,2}:\d{2}", data["время"])
-                if t:
-                    data["время"] = t.group(0).zfill(5)
-            print(f"✅ Данные извлечены через Claude: {data}")
-            return data
-    except Exception as e:
-        print(f"❌ Ошибка извлечения данных: {e}")
-        return None
-
-
 async def process_reply(reply: str, source: str, contact: str) -> str:
-    booking = await extract_booking_from_reply(reply)
+    booking = await extract_booking(reply)
     if not booking:
         return reply
 
+    # Убираем строку ЗАПИСЬ: из ответа клиенту
     clean_reply = reply
-    # Убираем строку ЗАПИСЬ: если она есть
     for line in reply.split("\n"):
         if line.startswith("ЗАПИСЬ:"):
             clean_reply = reply.replace(line, "").strip()
             break
 
-    # Проверяем занятость слота
-    is_free, free_slots = await is_slot_free(booking["дата"], booking["время"])
+    # Проверяем занятость
+    is_free, suggestions = await check_slot(booking["дата"], booking["время"])
 
     if not is_free:
-        if free_slots:
-            free_str = ", ".join(free_slots[:5])
-            busy_msg = (
-                f"К сожалению, {booking['дата']} в {booking['время']} уже занято 😔\n\n"
-                f"В этот день свободны: {free_str} (по Астане)\n\n"
+        if suggestions:
+            s = " и ".join(suggestions)
+            msg = (
+                f"К сожалению, {booking['время']} {booking['дата']} уже занято 😔\n\n"
+                f"В этот день рядом свободно: {s} (по Астане)\n\n"
                 f"Какое время вам подойдёт?"
             )
         else:
-            busy_msg = (
-                f"К сожалению, {booking['дата']} полностью занято 😔\n\n"
-                f"Давайте подберём другой день — какая дата вам подходит?"
+            msg = (
+                f"К сожалению, {booking['дата']} полностью занят 😔\n\n"
+                f"Давайте подберём другой день — какая дата вам удобна?"
             )
         print(f"⚠️ Слот занят: {booking['дата']} {booking['время']}")
-        return busy_msg
+        return msg
 
+    # Записываем в календарь
     calendar_ok = False
     if GOOGLE_CALENDAR_ID and GOOGLE_CREDS:
         calendar_ok = await create_calendar_event(
@@ -409,13 +406,14 @@ async def process_reply(reply: str, source: str, contact: str) -> str:
             city=booking["город"],
         )
 
+    # Уведомляем Алию
     if PSYCHOLOGIST_PHONE:
         cal_status = "✅ Добавлено в Google Calendar" if calendar_ok else "⚠️ Добавьте в календарь вручную"
         notify = (
             f"📋 Новая запись через {source}!\n\n"
             f"Клиент: {booking.get('имя')}\n"
             f"Город: {booking.get('город')}\n"
-            f"Дата: {booking.get('дата')} в {booking.get('время')} (по Астане)\n"
+            f"Дата: {booking.get('дата')} в {booking.get('время')} (Астана)\n"
             f"Запрос: {booking.get('запрос')}\n"
             f"Контакт: {contact}\n\n"
             f"{cal_status}"
@@ -471,8 +469,8 @@ async def handle_telegram(body: dict):
         text = "Здравствуйте! Хочу узнать подробнее о консультациях."
 
     username = message.get("from", {}).get("username", "")
-    name = message.get("from", {}).get("first_name", "")
-    contact = f"@{username}" if username else name
+    name     = message.get("from", {}).get("first_name", "")
+    contact  = f"@{username}" if username else name
 
     reply = await ask_claude(f"tg:{chat_id}", text)
     reply = await process_reply(reply, "Telegram", contact)
@@ -527,10 +525,9 @@ async def telegram_webhook(request: Request):
 
 @app.get("/")
 async def root():
-    return {"status": f"Бот Алии — WhatsApp + Telegram + Google Calendar ✅"}
+    return {"status": "Бот Алии — WhatsApp + Telegram + Google Calendar ✅"}
 
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
-
