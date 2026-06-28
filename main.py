@@ -266,7 +266,11 @@ async def extract_booking_from_reply(reply: str) -> dict | None:
                 },
             )
             text = resp.json()["content"][0]["text"].strip()
-            if text == "null":
+            print(f"EXTRACT RAW: {text[:300]}")
+            if not text or text == "null":
+                return None
+            text = text.replace("```json", "").replace("```", "").strip()
+            if not text or text == "null":
                 return None
             data = json.loads(text)
             # Исправляем год если нужно
