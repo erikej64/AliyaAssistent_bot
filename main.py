@@ -125,7 +125,83 @@ async def get_google_token() -> str:
             raise Exception(f"Token error: {data}")
         return data["access_token"]
 
+async def get_busy_slots(date: str) -> list[tuple[str, str]]:
+    """Получить занятые слоты на дату (возвращает список (начало, конец) по Астане)"""
+    try:
+        token = await get_google_token()
+        # Начало и конец дня в UTC (Астана UTC+5, значит -5 часов)
+        day_start = f"{date}T00:00:00+05:00"
+        day_end = f"{date}T23:59:59+05:00"
 
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"https://www.googleapis.com/calendar/v3/calendars/{GOOGLE_CALENDAR_ID}/events",
+                headers={"Authorization": f"Bearer {token}"},
+                params={
+                    "timeMin": day_start,
+                    "timeMax": day_end,
+                    "singleEvents": "true",
+                    "orderBy": "startTime",
+                },
+            )
+            events = resp.json().get("items", [])
+            slots = []
+            for e in events:
+                start = e.get("start", {}).get("dateTime", "")
+                end = e.get("end", {}).get("dateTime", "")
+                if start and end:
+                    # Берём только ЧЧ:ММ
+                    s = start[11:16]
+                    en = end[11:16]
+                    slots.append((s, en))
+            print(f"Занятые слоты на {date}: {slots}")
+            return slots
+    except Exception as e:
+        print(f"❌ Ошибка чтения календаря: {e}")
+        return []
+
+
+async def is_slot_free(date: str, time_str: str) -> tuple[bool, list[str]]:
+    """Проверить свободен ли слот. Возвращает (свободен, список свободных часов дня)"""
+    busy = await get_busy_slots(date)
+    
+    # Время начала и конца новой записи
+    try:
+        h, m = map(int, time_str.split(":"))
+        new_start = h * 60 + m
+        new_end = new_start + 90  # 1.5 часа
+    except:
+        return True, []
+
+    # Проверяем пересечение
+    for (s, e) in busy:
+        try:
+            sh, sm = map(int, s.split(":"))
+            eh, em = map(int, e.split(":"))
+            busy_start = sh * 60 + sm
+            busy_end = eh * 60 + em
+            if new_start < busy_end and new_end > busy_start:
+                # Слот занят — найдём свободные часы
+                free = []
+                for hour in range(9, 21):  # с 9:00 до 21:00
+                    slot_start = hour * 60
+                    slot_end = slot_start + 90
+                    free_slot = True
+                    for (bs, be) in busy:
+                        bsh, bsm = map(int, bs.split(":"))
+                        beh, bem = map(int, be.split(":"))
+                        bs_min = bsh * 60 + bsm
+                        be_min = beh * 60 + bem
+                        if slot_start < be_min and slot_end > bs_min:
+                            free_slot = False
+                            break
+                    if free_slot:
+                        free.append(f"{hour:02d}:00")
+                return False, free
+        except:
+            continue
+    
+    return True, []
 async def create_calendar_event(name: str, date: str, time_str: str, request_text: str, city: str) -> bool:
     try:
         token = await get_google_token()
@@ -303,6 +379,25 @@ async def process_reply(reply: str, source: str, contact: str) -> str:
         if line.startswith("ЗАПИСЬ:"):
             clean_reply = reply.replace(line, "").strip()
             break
+
+    # Проверяем занятость слота
+    is_free, free_slots = await is_slot_free(booking["дата"], booking["время"])
+
+    if not is_free:
+        if free_slots:
+            free_str = ", ".join(free_slots[:5])
+            busy_msg = (
+                f"К сожалению, {booking['дата']} в {booking['время']} уже занято 😔\n\n"
+                f"В этот день свободны: {free_str} (по Астане)\n\n"
+                f"Какое время вам подойдёт?"
+            )
+        else:
+            busy_msg = (
+                f"К сожалению, {booking['дата']} полностью занято 😔\n\n"
+                f"Давайте подберём другой день — какая дата вам подходит?"
+            )
+        print(f"⚠️ Слот занят: {booking['дата']} {booking['время']}")
+        return busy_msg
 
     calendar_ok = False
     if GOOGLE_CALENDAR_ID and GOOGLE_CREDS:
