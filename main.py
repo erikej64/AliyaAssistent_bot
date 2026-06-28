@@ -155,6 +155,7 @@ async def create_calendar_event(name: str, date: str, time_str: str, request_tex
 
 def parse_booking(line: str) -> dict | None:
     try:
+        import re
         data = {}
         parts = line.replace("ЗАПИСЬ:", "").strip().split("|")
         for part in parts:
@@ -165,6 +166,10 @@ def parse_booking(line: str) -> dict | None:
             date_parts = data["дата"].split("-")
             if len(date_parts) == 3 and int(date_parts[0]) < CURRENT_YEAR:
                 data["дата"] = f"{CURRENT_YEAR}-{date_parts[1]}-{date_parts[2]}"
+            # Вытаскиваем только ЧЧ:ММ из поля времени (убираем "по Астане" и прочее)
+            time_match = re.search(r"\d{1,2}:\d{2}", data["время"])
+            if time_match:
+                data["время"] = time_match.group(0).zfill(5)
             return data
     except Exception:
         pass
@@ -353,3 +358,5 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+    
