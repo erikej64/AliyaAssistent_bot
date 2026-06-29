@@ -13,6 +13,7 @@ GREEN_API_TOKEN = os.environ["GREEN_API_TOKEN"]
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 PSYCHOLOGIST_PHONE = os.environ.get("PSYCHOLOGIST_PHONE", "")
 GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "")
+GOOGLE_CALENDAR_ID_PERSONAL = os.environ.get("GOOGLE_CALENDAR_ID_PERSONAL", "")
 
 _creds_raw = os.environ.get("GOOGLE_CREDENTIALS", "{}")
 try:
@@ -22,10 +23,9 @@ except Exception:
 
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
-# Длительность блока: 1.5ч сеанс + 0.5ч обработка = 2 часа = 120 минут
-SESSION_BLOCK = 120
-WORK_START = 10 * 60   # 10:00
-WORK_END   = 21 * 60   # 21:00
+SESSION_BLOCK = 120  # 1.5ч сеанс + 0.5ч обработка
+WORK_START = 10 * 60
+WORK_END   = 21 * 60
 
 
 def now_astana() -> datetime:
@@ -34,12 +34,12 @@ def now_astana() -> datetime:
 
 def get_system_prompt() -> str:
     now = now_astana()
-    today_str = now.strftime("%d.%m.%Y")
-    tomorrow  = (now + timedelta(days=1)).strftime("%d.%m.%Y")
-    day_after = (now + timedelta(days=2)).strftime("%d.%m.%Y")
-    weekday   = WEEKDAYS[now.weekday()]
+    today_str    = now.strftime("%d.%m.%Y")
+    tomorrow     = (now + timedelta(days=1)).strftime("%d.%m.%Y")
+    day_after    = (now + timedelta(days=2)).strftime("%d.%m.%Y")
+    weekday      = WEEKDAYS[now.weekday()]
     current_time = now.strftime("%H:%M")
-    year = now.year
+    year         = now.year
 
     return f"""Ты — ассистент психолога Алии. Ты не проводишь терапию, не ставишь диагнозы, не даёшь медицинских назначений.
 
@@ -137,8 +137,8 @@ async def get_google_token() -> str:
         return data["access_token"]
 
 
-async def get_busy_slots(date: str) -> list[tuple[int, int]]:
-    """Возвращает список занятых интервалов (start_min, end_min) по Астане."""
+async def get_busy_slots(date: str, calendar_id: str = None) -> list[tuple[int, int]]:
+    """Возвращает занятые интервалы (start_min, end_min) по Астане для указанного календаря."""
     cal = calendar_id or GOOGLE_CALENDAR_ID
     try:
         token = await get_google_token()
@@ -156,33 +156,29 @@ async def get_busy_slots(date: str) -> list[tuple[int, int]]:
             events = resp.json().get("items", [])
             slots = []
             for e in events:
-                s = e.get("start", {}).get("dateTime", "")
+                s  = e.get("start", {}).get("dateTime", "")
                 en = e.get("end",   {}).get("dateTime", "")
                 if s and en:
-                    sh, sm = int(s[11:13]), int(s[14:16])
+                    sh, sm = int(s[11:13]),  int(s[14:16])
                     eh, em = int(en[11:13]), int(en[14:16])
                     slots.append((sh * 60 + sm, eh * 60 + em))
-            print(f"Занятые слоты на {date}: {slots}")
+            print(f"Занятые слоты [{cal[:20]}] на {date}: {slots}")
             return slots
     except Exception as e:
-        print(f"❌ Ошибка чтения календаря: {e}")
+        print(f"❌ Ошибка чтения календаря {cal[:20]}: {e}")
         return []
 
 
 async def check_slot(date: str, time_str: str) -> tuple[bool, list[str]]:
-    """Проверить слот. Возвращает (свободен, [до, после]) — 2 ближайших свободных."""
-    busy = await get_busy_slots(date)
-# Проверяем также личный календарь Алии
-    personal_id = os.environ.get("GOOGLE_CALENDAR_ID_PERSONAL", "")
-    if personal_id:
-        personal_busy = await get_busy_slots(date, personal_id)
-        busy = busy + personal_busy
+    """Проверить слот в обоих календарях. Возвращает (свободен, 2 ближайших слота)."""
+    # Читаем оба календаря
+    busy = await get_busy_slots(date, GOOGLE_CALENDAR_ID)
+    if GOOGLE_CALENDAR_ID_PERSONAL:
+        busy += await get_busy_slots(date, GOOGLE_CALENDAR_ID_PERSONAL)
+
     h, m = map(int, time_str.split(":"))
     req_start = h * 60 + m
-    req_end   = req_start + SESSION_BLOCK  # занимаем 120 минут
-
-    def overlaps(s: int, e: int) -> bool:
-        return s < req_end and e > req_start
+    req_end   = req_start + SESSION_BLOCK
 
     def slot_free(s: int) -> bool:
         se = s + SESSION_BLOCK
@@ -192,8 +188,7 @@ async def check_slot(date: str, time_str: str) -> tuple[bool, list[str]]:
         return True
 
     # Проверяем запрошенный слот
-    if any(overlaps(bs, be) for bs, be in busy):
-        # Ищем свободные слоты — шаг 30 минут для точности предложений
+    if not slot_free(req_start):
         before, after = [], []
         for mins in range(WORK_START, WORK_END - SESSION_BLOCK + 1, 30):
             if slot_free(mins):
@@ -202,14 +197,14 @@ async def check_slot(date: str, time_str: str) -> tuple[bool, list[str]]:
                 label = f"{mins // 60:02d}:00"
                 if mins < req_start and slot_free(mins):
                     before.append(label)
-                elif mins >= req_end + SESSION_BLOCK:
+                elif mins >= req_start + SESSION_BLOCK:
                     after.append(label)
 
         suggestions = []
         if before:
-            suggestions.append(before[-1])   # ближайший ДО
+            suggestions.append(before[-1])
         if after:
-            suggestions.append(after[0])     # ближайший ПОСЛЕ
+            suggestions.append(after[0])
 
         return False, suggestions
 
@@ -218,9 +213,9 @@ async def check_slot(date: str, time_str: str) -> tuple[bool, list[str]]:
 
 async def create_calendar_event(name: str, date: str, time_str: str, request_text: str, city: str) -> bool:
     try:
-        token = await get_google_token()
+        token    = await get_google_token()
         start_dt = datetime.strptime(f"{date} {time_str}", "%Y-%m-%d %H:%M")
-        end_dt   = start_dt + timedelta(hours=1, minutes=30)  # длина сеанса 1.5ч
+        end_dt   = start_dt + timedelta(hours=1, minutes=30)
 
         event = {
             "summary": f"Консультация: {name}" if name else "Консультация",
@@ -260,18 +255,16 @@ async def create_calendar_event(name: str, date: str, time_str: str, request_tex
 
 def parse_booking_line(line: str) -> dict | None:
     try:
-        data = {}
+        data  = {}
         parts = line.replace("ЗАПИСЬ:", "").strip().split("|")
         for part in parts:
             key, _, val = part.partition(":")
             data[key.strip().lower()] = val.strip()
         if not all(k in data for k in ["имя", "город", "дата", "время", "запрос"]):
             return None
-        # Исправляем год
         dp = data["дата"].split("-")
         if len(dp) == 3 and int(dp[0]) < now_astana().year:
             data["дата"] = f"{now_astana().year}-{dp[1]}-{dp[2]}"
-        # Очищаем время
         t = re.search(r"\d{1,2}:\d{2}", data["время"])
         if t:
             data["время"] = t.group(0).zfill(5)
@@ -281,19 +274,17 @@ def parse_booking_line(line: str) -> dict | None:
 
 
 async def extract_booking(reply: str) -> dict | None:
-    # Попытка 1: строка ЗАПИСЬ:
     for line in reply.split("\n"):
         if line.startswith("ЗАПИСЬ:"):
             result = parse_booking_line(line)
             if result:
                 return result
 
-    # Попытка 2: Claude извлекает из текста
     keywords = ["подтверждаю", "записал", "записала", "запись", "консультаци"]
     if not any(k in reply.lower() for k in keywords):
         return None
 
-    now = now_astana()
+    now    = now_astana()
     prompt = f"""Из текста извлеки данные о записи клиента к психологу.
 Сегодня: {now.strftime('%Y-%m-%d')}.
 Верни ТОЛЬКО JSON (без markdown, без пояснений):
@@ -324,12 +315,10 @@ async def extract_booking(reply: str) -> dict | None:
             if not text or text == "null":
                 return None
             data = json.loads(text)
-            # Исправляем год
             if data.get("дата"):
                 m2 = re.match(r"(\d{4})-(\d{2})-(\d{2})", data["дата"])
                 if m2 and int(m2.group(1)) < now.year:
                     data["дата"] = f"{now.year}-{m2.group(2)}-{m2.group(3)}"
-            # Очищаем время
             if data.get("время"):
                 t2 = re.search(r"\d{1,2}:\d{2}", data["время"])
                 if t2:
@@ -376,19 +365,17 @@ async def process_reply(reply: str, source: str, contact: str) -> str:
     if not booking:
         return reply
 
-    # Убираем строку ЗАПИСЬ: из ответа клиенту
     clean_reply = reply
     for line in reply.split("\n"):
         if line.startswith("ЗАПИСЬ:"):
             clean_reply = reply.replace(line, "").strip()
             break
 
-    # Проверяем занятость
     is_free, suggestions = await check_slot(booking["дата"], booking["время"])
 
     if not is_free:
         if suggestions:
-            s = " и ".join(suggestions)
+            s   = " и ".join(suggestions)
             msg = (
                 f"К сожалению, {booking['время']} {booking['дата']} уже занято 😔\n\n"
                 f"В этот день рядом свободно: {s} (по Астане)\n\n"
@@ -402,7 +389,6 @@ async def process_reply(reply: str, source: str, contact: str) -> str:
         print(f"⚠️ Слот занят: {booking['дата']} {booking['время']}")
         return msg
 
-    # Записываем в календарь
     calendar_ok = False
     if GOOGLE_CALENDAR_ID and GOOGLE_CREDS:
         calendar_ok = await create_calendar_event(
@@ -413,7 +399,6 @@ async def process_reply(reply: str, source: str, contact: str) -> str:
             city=booking["город"],
         )
 
-    # Уведомляем Алию
     if PSYCHOLOGIST_PHONE:
         cal_status = "✅ Добавлено в Google Calendar" if calendar_ok else "⚠️ Добавьте в календарь вручную"
         notify = (
@@ -444,7 +429,7 @@ async def handle_whatsapp(body: dict):
     msg = body.get("messageData", {})
     if msg.get("typeMessage") != "textMessage":
         return
-    text = msg.get("textMessageData", {}).get("textMessage", "").strip()
+    text    = msg.get("textMessageData", {}).get("textMessage", "").strip()
     chat_id = body.get("senderData", {}).get("chatId", "")
     if not text or not chat_id or "@g.us" in chat_id:
         return
@@ -467,7 +452,7 @@ async def handle_telegram(body: dict):
     message = body.get("message") or body.get("edited_message")
     if not message:
         return
-    text = message.get("text", "").strip()
+    text    = message.get("text", "").strip()
     chat_id = message.get("chat", {}).get("id")
     if not text or not chat_id:
         return
