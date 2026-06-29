@@ -139,11 +139,12 @@ async def get_google_token() -> str:
 
 async def get_busy_slots(date: str) -> list[tuple[int, int]]:
     """Возвращает список занятых интервалов (start_min, end_min) по Астане."""
+    cal = calendar_id or GOOGLE_CALENDAR_ID
     try:
         token = await get_google_token()
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
-                f"https://www.googleapis.com/calendar/v3/calendars/{GOOGLE_CALENDAR_ID}/events",
+                f"https://www.googleapis.com/calendar/v3/calendars/{cal}/events",
                 headers={"Authorization": f"Bearer {token}"},
                 params={
                     "timeMin": f"{date}T00:00:00+05:00",
@@ -171,7 +172,11 @@ async def get_busy_slots(date: str) -> list[tuple[int, int]]:
 async def check_slot(date: str, time_str: str) -> tuple[bool, list[str]]:
     """Проверить слот. Возвращает (свободен, [до, после]) — 2 ближайших свободных."""
     busy = await get_busy_slots(date)
-
+# Проверяем также личный календарь Алии
+    personal_id = os.environ.get("GOOGLE_CALENDAR_ID_PERSONAL", "")
+    if personal_id:
+        personal_busy = await get_busy_slots(date, personal_id)
+        busy = busy + personal_busy
     h, m = map(int, time_str.split(":"))
     req_start = h * 60 + m
     req_end   = req_start + SESSION_BLOCK  # занимаем 120 минут
