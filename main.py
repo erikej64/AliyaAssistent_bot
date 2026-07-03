@@ -427,9 +427,13 @@ async def handle_whatsapp(body: dict):
     if body.get("typeWebhook") != "incomingMessageReceived":
         return
     msg = body.get("messageData", {})
-    if msg.get("typeMessage") != "textMessage":
+    msg_type = msg.get("typeMessage")
+    if msg_type == "textMessage":
+        text = msg.get("textMessageData", {}).get("textMessage", "").strip()
+    elif msg_type == "extendedTextMessage":
+        text = msg.get("extendedTextMessageData", {}).get("text", "").strip()
+    else:
         return
-    text    = msg.get("textMessageData", {}).get("textMessage", "").strip()
     chat_id = body.get("senderData", {}).get("chatId", "")
     if not text or not chat_id or "@g.us" in chat_id:
         return
