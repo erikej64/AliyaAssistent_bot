@@ -420,7 +420,8 @@ async def process_reply(reply: str, source: str, contact: str) -> str:
 async def send_whatsapp(chat_id: str, message: str):
     url = f"https://api.green-api.com/waInstance{GREEN_API_ID}/sendMessage/{GREEN_API_TOKEN}"
     async with httpx.AsyncClient(timeout=30) as client:
-        await client.post(url, json={"chatId": chat_id, "message": message})
+        resp = await client.post(url, json={"chatId": chat_id, "message": message})
+        print(f"WA send [{chat_id}]: status={resp.status_code} body={resp.text[:200]}")
 
 
 async def handle_whatsapp(body: dict):
@@ -533,3 +534,4 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
