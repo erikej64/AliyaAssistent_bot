@@ -428,20 +428,26 @@ async def handle_whatsapp(body: dict):
         return
     msg = body.get("messageData", {})
     msg_type = msg.get("typeMessage")
+
     if msg_type == "textMessage":
         text = msg.get("textMessageData", {}).get("textMessage", "").strip()
     elif msg_type == "extendedTextMessage":
         text = msg.get("extendedTextMessageData", {}).get("text", "").strip()
     else:
         return
+
     chat_id = body.get("senderData", {}).get("chatId", "")
     if not text or not chat_id or "@g.us" in chat_id:
         return
 
+    print(f"WA incoming [{chat_id}]: {text[:100]}")
     phone = chat_id.replace("@c.us", "")
-    reply = await ask_claude(f"wa:{chat_id}", text)
-    reply = await process_reply(reply, "WhatsApp", f"+{phone}")
-    await send_whatsapp(chat_id, reply)
+    try:
+        reply = await ask_claude(f"wa:{chat_id}", text)
+        reply = await process_reply(reply, "WhatsApp", f"+{phone}")
+        await send_whatsapp(chat_id, reply)
+    except Exception as e:
+        print(f"WA error: {e}")
 
 
 # ───────────────────────── Telegram ─────────────────────────
