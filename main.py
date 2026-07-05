@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import asyncio
 import httpx
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
@@ -88,6 +89,83 @@ def get_system_prompt() -> str:
 
 
 conversations: dict[str, list] = {}
+
+# Хранилище запланированных напоминаний
+# {task_id: {"chat_id": ..., "channel": "wa"/"tg", "name": ..., "time": datetime, "tasks": [...]}}
+reminders: dict[str, dict] = {}
+
+
+async def send_reminder(channel: str, chat_id: str, message: str):
+    """Отправить напоминание клиенту"""
+    try:
+        if channel == "tg":
+            await send_telegram(int(chat_id), message)
+        else:
+            await send_whatsapp(chat_id, message)
+        print(f"✅ Напоминание отправлено [{channel}:{chat_id}]")
+    except Exception as e:
+        print(f"❌ Ошибка отправки напоминания: {e}")
+
+
+async def schedule_reminders(channel: str, chat_id: str, name: str, date: str, time_str: str):
+    """Запланировать напоминания за 24 часа и за 1 час до сеанса"""
+    try:
+        session_dt = datetime.strptime(f"{date} {time_str}", "%Y-%m-%d %H:%M")
+        now = now_astana()
+
+        remind_24h = session_dt - timedelta(hours=24)
+        remind_1h  = session_dt - timedelta(hours=1)
+
+        key = f"{channel}:{chat_id}:{date}:{time_str}"
+
+        msg_24h = (
+            f"Здравствуйте, {name}! 👋
+
+"
+            f"Напоминаю что завтра у вас консультация с Алией.
+"
+            f"📅 {date} в {time_str} (по Астане)
+
+"
+            f"Если что-то изменилось — напишите нам."
+        )
+
+        msg_1h = (
+            f"Здравствуйте, {name}! ⏰
+
+"
+            f"Через 1 час начинается ваша консультация с Алией.
+"
+            f"📅 Сегодня в {time_str} (по Астане)
+
+"
+            f"Алия скоро отправит ссылку на видеосвязь."
+        )
+
+        tasks = []
+
+        if remind_24h > now:
+            delay_24h = (remind_24h - now).total_seconds()
+            t1 = asyncio.create_task(remind_after(delay_24h, channel, chat_id, msg_24h))
+            tasks.append(t1)
+            print(f"⏰ Напоминание за 24ч запланировано через {delay_24h/3600:.1f}ч [{key}]")
+
+        if remind_1h > now:
+            delay_1h = (remind_1h - now).total_seconds()
+            t2 = asyncio.create_task(remind_after(delay_1h, channel, chat_id, msg_1h))
+            tasks.append(t2)
+            print(f"⏰ Напоминание за 1ч запланировано через {delay_1h/3600:.1f}ч [{key}]")
+
+        reminders[key] = {"tasks": tasks, "name": name, "dt": session_dt}
+
+    except Exception as e:
+        print(f"❌ Ошибка планирования напоминаний: {e}")
+
+
+async def remind_after(delay: float, channel: str, chat_id: str, message: str):
+    """Подождать delay секунд и отправить напоминание"""
+    await asyncio.sleep(delay)
+    await send_reminder(channel, chat_id, message)
 
 
 # ───────────────────────── Google Calendar ─────────────────────────
@@ -218,7 +296,7 @@ async def create_calendar_event(name: str, date: str, time_str: str, request_tex
         end_dt   = start_dt + timedelta(hours=1, minutes=30)
 
         event = {
-            "summary": f"Консультация: {name}" if name else "Консультация",
+            "summary": f"Консультация: {name} | {city} | {request_text}",
             "description": (
                 f"Клиент: {name}\nГород: {city}\nЗапрос: {request_text}\n"
                 f"Время по Астане (UTC+5)\nЗаписан через бота"
@@ -360,7 +438,7 @@ async def ask_claude(chat_id: str, user_message: str) -> str:
     return reply
 
 
-async def process_reply(reply: str, source: str, contact: str) -> str:
+async def process_reply(reply: str, source: str, contact: str, raw_chat_id: str = "") -> str:
     booking = await extract_booking(reply)
     if not booking:
         return reply
@@ -411,6 +489,10 @@ async def process_reply(reply: str, source: str, contact: str) -> str:
             f"{cal_status}"
         )
         await send_whatsapp(PSYCHOLOGIST_PHONE + "@c.us", notify)
+
+    # Планируем напоминания клиенту
+    channel = "tg" if source == "Telegram" else "wa"
+    await schedule_reminders(channel, raw_chat_id, booking.get("имя", ""), booking.get("дата", ""), booking.get("время", ""))
 
     return clean_reply
 
@@ -476,7 +558,7 @@ async def handle_telegram(body: dict):
     contact  = f"@{username}" if username else name
 
     reply = await ask_claude(f"tg:{chat_id}", text)
-    reply = await process_reply(reply, "Telegram", contact)
+    reply = await process_reply(reply, "Telegram", contact, str(chat_id))
     await send_telegram(chat_id, reply)
 
 
