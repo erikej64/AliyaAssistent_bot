@@ -27,6 +27,12 @@ SESSION_BLOCK = 120
 WORK_START = 10 * 60
 WORK_END   = 21 * 60
 
+# Отслеживаем уже отправленные уведомления чтобы не дублировать
+sent_reminders: set = set()
+# Хранилище напоминаний от бота (asyncio tasks)
+reminders: dict[str, dict] = {}
+conversations: dict[str, list] = {}
+
 
 def now_astana() -> datetime:
     return datetime.utcnow() + timedelta(hours=5)
@@ -87,14 +93,29 @@ def get_system_prompt() -> str:
 Не используй маркированные списки со звёздочками или дефисами."""
 
 
-conversations: dict[str, list] = {}
-reminders: dict[str, dict] = {}
+# ───────────────────────── Отправка сообщений ─────────────────────────
+
+async def send_whatsapp(chat_id: str, message: str):
+    url = f"https://api.green-api.com/waInstance{GREEN_API_ID}/sendMessage/{GREEN_API_TOKEN}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url, json={"chatId": chat_id, "message": message})
+        print(f"WA send [{chat_id}]: status={resp.status_code} body={resp.text[:100]}")
+
+
+async def send_telegram(chat_id: int, text: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    async with httpx.AsyncClient(timeout=30) as client:
+        await client.post(url, json={"chat_id": chat_id, "text": text})
+
+
+async def notify_aliya(message: str):
+    if PSYCHOLOGIST_PHONE:
+        await send_whatsapp(PSYCHOLOGIST_PHONE + "@c.us", message)
 
 
 # ───────────────────────── Напоминания ─────────────────────────
 
-async def remind_after(delay: float, channel: str, chat_id: str, message: str):
-    await asyncio.sleep(delay)
+async def send_reminder_to_client(channel: str, chat_id: str, message: str):
     try:
         if channel == "tg":
             await send_telegram(int(chat_id), message)
@@ -102,7 +123,13 @@ async def remind_after(delay: float, channel: str, chat_id: str, message: str):
             await send_whatsapp(chat_id, message)
         print(f"Напоминание отправлено [{channel}:{chat_id}]")
     except Exception as e:
-        print(f"Ошибка напоминания: {e}")
+        print(f"Ошибка напоминания клиенту: {e}")
+
+
+async def remind_after(delay: float, channel: str, chat_id: str, message: str, aliya_msg: str):
+    await asyncio.sleep(delay)
+    await send_reminder_to_client(channel, chat_id, message)
+    await notify_aliya(aliya_msg)
 
 
 async def schedule_reminders(channel: str, chat_id: str, name: str, date: str, time_str: str):
@@ -111,18 +138,31 @@ async def schedule_reminders(channel: str, chat_id: str, name: str, date: str, t
         now = now_astana()
         key = f"{channel}:{chat_id}:{date}:{time_str}"
 
-        msg_24h = (
+        # Сообщения клиенту
+        msg_client_24h = (
             "Здравствуйте, " + name + "! 👋\n\n"
             "Напоминаю что завтра у вас консультация с Алией.\n"
             "Дата: " + date + " в " + time_str + " (по Астане)\n\n"
             "Если что-то изменилось — напишите нам."
         )
-
-        msg_1h = (
+        msg_client_1h = (
             "Здравствуйте, " + name + "! ⏰\n\n"
             "Через 1 час начинается ваша консультация с Алией.\n"
             "Сегодня в " + time_str + " (по Астане)\n\n"
             "Алия скоро отправит ссылку на видеосвязь."
+        )
+
+        # Сообщения Алие
+        msg_aliya_24h = (
+            "Напоминание: завтра консультация!\n\n"
+            "Клиент: " + name + "\n"
+            "Время: " + date + " в " + time_str + " (Астана)"
+        )
+        msg_aliya_1h = (
+            "Через 1 час консультация!\n\n"
+            "Клиент: " + name + "\n"
+            "Время: " + time_str + " (Астана)\n\n"
+            "Не забудьте отправить ссылку на видеосвязь."
         )
 
         tasks = []
@@ -131,13 +171,13 @@ async def schedule_reminders(channel: str, chat_id: str, name: str, date: str, t
 
         if remind_24h > now:
             delay = (remind_24h - now).total_seconds()
-            t = asyncio.create_task(remind_after(delay, channel, chat_id, msg_24h))
+            t = asyncio.create_task(remind_after(delay, channel, chat_id, msg_client_24h, msg_aliya_24h))
             tasks.append(t)
             print(f"Напоминание за 24ч через {delay/3600:.1f}ч [{key}]")
 
         if remind_1h > now:
             delay = (remind_1h - now).total_seconds()
-            t = asyncio.create_task(remind_after(delay, channel, chat_id, msg_1h))
+            t = asyncio.create_task(remind_after(delay, channel, chat_id, msg_client_1h, msg_aliya_1h))
             tasks.append(t)
             print(f"Напоминание за 1ч через {delay/3600:.1f}ч [{key}]")
 
@@ -193,13 +233,12 @@ async def get_google_token() -> str:
         return data["access_token"]
 
 
-async def get_busy_slots(date: str, calendar_id: str = None) -> list[tuple[int, int]]:
-    cal = calendar_id or GOOGLE_CALENDAR_ID
+async def get_events_for_date(date: str, calendar_id: str) -> list[dict]:
     try:
         token = await get_google_token()
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
-                f"https://www.googleapis.com/calendar/v3/calendars/{cal}/events",
+                f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events",
                 headers={"Authorization": f"Bearer {token}"},
                 params={
                     "timeMin": f"{date}T00:00:00+05:00",
@@ -208,19 +247,28 @@ async def get_busy_slots(date: str, calendar_id: str = None) -> list[tuple[int, 
                     "orderBy": "startTime",
                 },
             )
-            events = resp.json().get("items", [])
-            slots = []
-            for e in events:
-                s  = e.get("start", {}).get("dateTime", "")
-                en = e.get("end",   {}).get("dateTime", "")
-                if s and en:
-                    sh, sm = int(s[11:13]),  int(s[14:16])
-                    eh, em = int(en[11:13]), int(en[14:16])
-                    slots.append((sh * 60 + sm, eh * 60 + em))
-            print(f"Занятые слоты [{cal[:20]}] на {date}: {slots}")
-            return slots
+            return resp.json().get("items", [])
     except Exception as e:
-        print(f"Ошибка чтения календаря: {e}")
+        print(f"Ошибка получения событий: {e}")
+        return []
+
+
+async def get_busy_slots(date: str, calendar_id: str = None) -> list[tuple[int, int]]:
+    cal = calendar_id or GOOGLE_CALENDAR_ID
+    try:
+        events = await get_events_for_date(date, cal)
+        slots = []
+        for e in events:
+            s  = e.get("start", {}).get("dateTime", "")
+            en = e.get("end",   {}).get("dateTime", "")
+            if s and en:
+                sh, sm = int(s[11:13]), int(s[14:16])
+                eh, em = int(en[11:13]), int(en[14:16])
+                slots.append((sh * 60 + sm, eh * 60 + em))
+        print(f"Занятые слоты [{cal[:20]}] на {date}: {slots}")
+        return slots
+    except Exception as e:
+        print(f"Ошибка чтения слотов: {e}")
         return []
 
 
@@ -243,15 +291,14 @@ async def check_slot(date: str, time_str: str) -> tuple[bool, list[str]]:
     if not slot_free(req_start):
         before, after = [], []
         for mins in range(WORK_START, WORK_END - SESSION_BLOCK + 1, 30):
+            if mins % 60 != 0:
+                continue
             if slot_free(mins):
-                if mins % 60 != 0:
-                    continue
                 label = f"{mins // 60:02d}:00"
                 if mins < req_start and slot_free(mins):
                     before.append(label)
                 elif mins >= req_start + SESSION_BLOCK:
                     after.append(label)
-
         suggestions = []
         if before:
             suggestions.append(before[-1])
@@ -262,17 +309,30 @@ async def check_slot(date: str, time_str: str) -> tuple[bool, list[str]]:
     return True, []
 
 
-async def create_calendar_event(name: str, date: str, time_str: str, request_text: str, city: str) -> bool:
+async def create_calendar_event(name: str, date: str, time_str: str,
+                                 request_text: str, city: str,
+                                 client_phone: str = "", client_tg: str = "") -> bool:
     try:
         token    = await get_google_token()
         start_dt = datetime.strptime(f"{date} {time_str}", "%Y-%m-%d %H:%M")
         end_dt   = start_dt + timedelta(hours=1, minutes=30)
 
+        # Добавляем контакт клиента в описание для ручных уведомлений
+        contact_line = ""
+        if client_phone:
+            contact_line = f"Телефон: {client_phone}\n"
+        elif client_tg:
+            contact_line = f"Telegram: {client_tg}\n"
+
         event = {
             "summary": f"Консультация: {name} | {city} | {request_text}",
             "description": (
-                f"Клиент: {name}\nГород: {city}\nЗапрос: {request_text}\n"
-                f"Время по Астане (UTC+5)\nЗаписан через бота"
+                f"Клиент: {name}\n"
+                f"Город: {city}\n"
+                f"Запрос: {request_text}\n"
+                f"{contact_line}"
+                f"Время по Астане (UTC+5)\n"
+                f"Записан через бота"
             ),
             "start": {"dateTime": start_dt.strftime("%Y-%m-%dT%H:%M:00"), "timeZone": "Asia/Almaty"},
             "end":   {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:00"),   "timeZone": "Asia/Almaty"},
@@ -300,6 +360,125 @@ async def create_calendar_event(name: str, date: str, time_str: str, request_tex
     except Exception as e:
         print(f"Ошибка создания события: {e}")
         return False
+
+
+# ───────────────────────── Фоновая проверка календаря ─────────────────────────
+
+def extract_contact_from_description(description: str) -> tuple[str, str]:
+    """Извлечь телефон и telegram из описания события. Возвращает (phone, tg_username)"""
+    phone, tg = "", ""
+    if not description:
+        return phone, tg
+    for line in description.split("\n"):
+        line = line.strip()
+        if line.startswith("Телефон:"):
+            phone = line.replace("Телефон:", "").strip()
+        elif line.startswith("Telegram:"):
+            tg = line.replace("Telegram:", "").strip().lstrip("@")
+    return phone, tg
+
+
+def extract_name_from_summary(summary: str) -> str:
+    """Извлечь имя клиента из заголовка события"""
+    if "Консультация:" in summary:
+        parts = summary.replace("Консультация:", "").strip().split("|")
+        return parts[0].strip()
+    return "Клиент"
+
+
+async def check_calendar_reminders():
+    """Проверяет события на следующие 25 часов и отправляет уведомления"""
+    try:
+        now = now_astana()
+        # Проверяем события на сегодня и завтра
+        dates_to_check = [
+            now.strftime("%Y-%m-%d"),
+            (now + timedelta(days=1)).strftime("%Y-%m-%d"),
+        ]
+
+        for cal_id in [GOOGLE_CALENDAR_ID, GOOGLE_CALENDAR_ID_PERSONAL]:
+            if not cal_id:
+                continue
+            for date in dates_to_check:
+                events = await get_events_for_date(date, cal_id)
+                for event in events:
+                    start = event.get("start", {}).get("dateTime", "")
+                    if not start:
+                        continue
+
+                    # Парсим время события
+                    try:
+                        event_dt = datetime.strptime(start[:16], "%Y-%m-%dT%H:%M")
+                        event_dt = event_dt  # уже по Астане если timeZone=Asia/Almaty
+                    except Exception:
+                        continue
+
+                    summary     = event.get("summary", "")
+                    description = event.get("description", "")
+                    event_id    = event.get("id", "")
+                    name        = extract_name_from_summary(summary)
+                    time_str    = event_dt.strftime("%H:%M")
+                    date_str    = event_dt.strftime("%Y-%m-%d")
+
+                    phone, tg = extract_contact_from_description(description)
+                    if not phone and not tg:
+                        continue  # нет контакта — не можем отправить
+
+                    diff_hours = (event_dt - now).total_seconds() / 3600
+
+                    # Напоминание за 24 часа (от 23.5 до 24.5 часов до события)
+                    key_24h = f"24h:{event_id}"
+                    if 23.5 <= diff_hours <= 24.5 and key_24h not in sent_reminders:
+                        msg_client = (
+                            "Здравствуйте, " + name + "! 👋\n\n"
+                            "Напоминаю что завтра у вас консультация с Алией.\n"
+                            "Дата: " + date_str + " в " + time_str + " (по Астане)\n\n"
+                            "Если что-то изменилось — напишите нам."
+                        )
+                        msg_aliya = (
+                            "Напоминание: завтра консультация!\n\n"
+                            "Клиент: " + name + "\n"
+                            "Время: " + date_str + " в " + time_str + " (Астана)"
+                        )
+                        if phone:
+                            await send_whatsapp(phone + "@c.us", msg_client)
+                        elif tg:
+                            # Telegram username — нужен chat_id, пропускаем пока
+                            pass
+                        await notify_aliya(msg_aliya)
+                        sent_reminders.add(key_24h)
+                        print(f"Отправлено напоминание за 24ч: {name} {date_str} {time_str}")
+
+                    # Напоминание за 1 час (от 0.5 до 1.5 часов до события)
+                    key_1h = f"1h:{event_id}"
+                    if 0.5 <= diff_hours <= 1.5 and key_1h not in sent_reminders:
+                        msg_client = (
+                            "Здравствуйте, " + name + "! ⏰\n\n"
+                            "Через 1 час начинается ваша консультация с Алией.\n"
+                            "Сегодня в " + time_str + " (по Астане)\n\n"
+                            "Алия скоро отправит ссылку на видеосвязь."
+                        )
+                        msg_aliya = (
+                            "Через 1 час консультация!\n\n"
+                            "Клиент: " + name + "\n"
+                            "Время: " + time_str + " (Астана)\n\n"
+                            "Не забудьте отправить ссылку на видеосвязь."
+                        )
+                        if phone:
+                            await send_whatsapp(phone + "@c.us", msg_client)
+                        await notify_aliya(msg_aliya)
+                        sent_reminders.add(key_1h)
+                        print(f"Отправлено напоминание за 1ч: {name} {date_str} {time_str}")
+
+    except Exception as e:
+        print(f"Ошибка проверки календаря: {e}")
+
+
+async def calendar_checker_loop():
+    """Бесконечный цикл — проверяет каждые 15 минут"""
+    while True:
+        await check_calendar_reminders()
+        await asyncio.sleep(900)  # 15 минут
 
 
 # ───────────────────────── Парсинг ─────────────────────────
@@ -340,7 +519,7 @@ async def extract_booking(reply: str) -> dict | None:
         f"Из текста извлеки данные о записи клиента к психологу.\n"
         f"Сегодня: {now.strftime('%Y-%m-%d')}.\n"
         f"Верни ТОЛЬКО JSON (без markdown, без пояснений):\n"
-        f'{"{"}"имя": "...", "город": "...", "дата": "ГГГГ-ММ-ДД", "время": "ЧЧ:ММ", "запрос": "..."{"}"}\n'
+        "{\"имя\": \"...\", \"город\": \"...\", \"дата\": \"ГГГГ-ММ-ДД\", \"время\": \"ЧЧ:ММ\", \"запрос\": \"...\"}\n"
         f"Если данных нет — верни null.\n\nТекст:\n{reply}"
     )
 
@@ -427,17 +606,24 @@ async def process_reply(reply: str, source: str, contact: str, raw_chat_id: str 
         if suggestions:
             s   = " и ".join(suggestions)
             msg = (
-                f"К сожалению, {booking['время']} {booking['дата']} уже занято.\n\n"
-                f"В этот день рядом свободно: {s} (по Астане)\n\n"
-                f"Какое время вам подойдёт?"
+                "К сожалению, " + booking["время"] + " " + booking["дата"] + " уже занято.\n\n"
+                "В этот день рядом свободно: " + s + " (по Астане)\n\n"
+                "Какое время вам подойдёт?"
             )
         else:
             msg = (
-                f"К сожалению, {booking['дата']} полностью занят.\n\n"
-                f"Давайте подберём другой день — какая дата вам удобна?"
+                "К сожалению, " + booking["дата"] + " полностью занят.\n\n"
+                "Давайте подберём другой день — какая дата вам удобна?"
             )
         print(f"Слот занят: {booking['дата']} {booking['время']}")
         return msg
+
+    # Определяем контакт клиента для записи в календарь
+    client_phone, client_tg = "", ""
+    if source == "WhatsApp":
+        client_phone = raw_chat_id.replace("@c.us", "")
+    elif source == "Telegram":
+        client_tg = contact.lstrip("@")
 
     calendar_ok = False
     if GOOGLE_CALENDAR_ID and GOOGLE_CREDS:
@@ -447,22 +633,23 @@ async def process_reply(reply: str, source: str, contact: str, raw_chat_id: str 
             time_str=booking["время"],
             request_text=booking["запрос"],
             city=booking["город"],
+            client_phone=client_phone,
+            client_tg=client_tg,
         )
 
-    if PSYCHOLOGIST_PHONE:
-        cal_status = "Добавлено в Google Calendar" if calendar_ok else "Добавьте в календарь вручную"
-        notify = (
-            f"Новая запись через {source}!\n\n"
-            f"Клиент: {booking.get('имя')}\n"
-            f"Город: {booking.get('город')}\n"
-            f"Дата: {booking.get('дата')} в {booking.get('время')} (Астана)\n"
-            f"Запрос: {booking.get('запрос')}\n"
-            f"Контакт: {contact}\n\n"
-            f"{cal_status}"
-        )
-        await send_whatsapp(PSYCHOLOGIST_PHONE + "@c.us", notify)
+    # Уведомляем Алию
+    cal_status = "Добавлено в Google Calendar" if calendar_ok else "Добавьте в календарь вручную"
+    await notify_aliya(
+        "Новая запись через " + source + "!\n\n"
+        "Клиент: " + booking.get("имя", "") + "\n"
+        "Город: " + booking.get("город", "") + "\n"
+        "Дата: " + booking.get("дата", "") + " в " + booking.get("время", "") + " (Астана)\n"
+        "Запрос: " + booking.get("запрос", "") + "\n"
+        "Контакт: " + contact + "\n\n" +
+        cal_status
+    )
 
-    # Планируем напоминания клиенту
+    # Планируем напоминания через asyncio (для записей через бота)
     if raw_chat_id:
         channel = "tg" if source == "Telegram" else "wa"
         await schedule_reminders(
@@ -475,14 +662,7 @@ async def process_reply(reply: str, source: str, contact: str, raw_chat_id: str 
     return clean_reply
 
 
-# ───────────────────────── WhatsApp ─────────────────────────
-
-async def send_whatsapp(chat_id: str, message: str):
-    url = f"https://api.green-api.com/waInstance{GREEN_API_ID}/sendMessage/{GREEN_API_TOKEN}"
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(url, json={"chatId": chat_id, "message": message})
-        print(f"WA send [{chat_id}]: status={resp.status_code} body={resp.text[:200]}")
-
+# ───────────────────────── Handlers ─────────────────────────
 
 async def handle_whatsapp(body: dict):
     if body.get("typeWebhook") != "incomingMessageReceived":
@@ -509,14 +689,6 @@ async def handle_whatsapp(body: dict):
         await send_whatsapp(chat_id, reply)
     except Exception as e:
         print(f"WA error: {e}")
-
-
-# ───────────────────────── Telegram ─────────────────────────
-
-async def send_telegram(chat_id: int, text: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    async with httpx.AsyncClient(timeout=30) as client:
-        await client.post(url, json={"chat_id": chat_id, "text": text})
 
 
 async def handle_telegram(body: dict):
@@ -559,6 +731,8 @@ async def set_telegram_webhook():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await set_telegram_webhook()
+    asyncio.create_task(calendar_checker_loop())
+    print("Фоновая проверка календаря запущена (каждые 15 мин)")
     yield
 
 app = FastAPI(lifespan=lifespan)
