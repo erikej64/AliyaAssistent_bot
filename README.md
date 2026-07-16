@@ -4,7 +4,7 @@ WhatsApp-бот на базе Claude AI для психолога Алии.
 
 ## Деплой на Railway
 
-### 1. Загрузи код на GitHub
+### 1. Загрузи код на GitHub 
 - Создай новый репозиторий на github.com
 - Загрузи все файлы (main.py, requirements.txt, Procfile)
 
