@@ -1,7 +1,6 @@
 import os
 import re
 import json
-import asyncio
 import httpx
 import uvicorn
 import google.generativeai as genai
@@ -13,37 +12,46 @@ genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 model = genai.GenerativeModel('gemini-1.5-flash')
 app = FastAPI()
 
-SESSION_BLOCK = 120
-GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "")
-
-# --- ВАШИ ФУНКЦИИ ---
-async def get_google_token():
-    return os.environ.get("GOOGLE_TOKEN", "")
-
-async def get_events_for_date(date, calendar_id):
-    return []
-
-async def check_slot(date, time):
-    return True, []
-
-async def create_calendar_event(name, date, time_str, request_text, city, client_phone, client_tg):
-    return True
-
-async def extract_booking(text):
+# --- ВАША ЛОГИКА ---
+async def extract_booking(text: str) -> dict | None:
     match = re.search(r"ЗАПИСЬ:\s*(.*)", text, re.IGNORECASE)
     if not match: return None
     parts = match.group(1).split("|")
     res = {p.split(":")[0].strip().lower(): p.split(":")[1].strip() for p in parts if ":" in p}
     return res if "дата" in res and "время" in res else None
 
-async def find_and_delete_event(name, date):
-    return True
+async def ask_gemini(chat_id: str, user_message: str) -> str:
+    chat = model.start_chat(history=[])
+    response = await chat.send_message(user_message)
+    return response.text
 
-# --- ОСНОВНАЯ ЛОГИКА ---
+# --- ВЕБХУКИ ---
+
 @app.post("/whatsapp")
-async def handle_whatsapp(request: Request):
+async def whatsapp_webhook(request: Request):
     data = await request.json()
-    # Логика обработки вебхука
+    # Извлечение текста (адаптировано под GreenAPI)
+    text = data.get("messageData", {}).get("textMessageData", {}).get("textMessage", "")
+    chat_id = data.get("senderData", {}).get("chatId", "")
+    
+    if text:
+        reply = await ask_gemini(chat_id, text)
+        # Здесь должна быть логика отправки ответа через GreenAPI
+        print(f"WhatsApp ответ: {reply}")
+    return {"status": "ok"}
+
+@app.post("/telegram")
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    # Извлечение текста из Telegram (стандартная структура)
+    message = data.get("message", {})
+    text = message.get("text", "")
+    chat_id = str(message.get("chat", {}).get("id", ""))
+    
+    if text:
+        reply = await ask_gemini(chat_id, text)
+        # Здесь должна быть логика отправки ответа через Telegram API
+        print(f"Telegram ответ: {reply}")
     return {"status": "ok"}
 
 @app.get("/")
@@ -51,5 +59,5 @@ async def root():
     return {"status": "running"}
 
 if __name__ == "__main__":
-    # Явный запуск на порту 8080
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    # Фиксируем порт 8080 для Fly.io
+    uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=False)
