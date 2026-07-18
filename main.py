@@ -3,7 +3,6 @@ import httpx
 from fastapi import FastAPI, Request
 
 # --- КОНФИГУРАЦИЯ ---
-# Используем имя переменной, которое мы создадим в секретах
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 GREEN_API_ID = os.environ.get("GREEN_API_ID", "")
@@ -13,14 +12,21 @@ app = FastAPI()
 
 # --- ЛОГИКА GEMINI ---
 async def ask_gemini(text):
-    # Этот запрос просто выведет список всех доступных вам моделей в ответ
-    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
+    # Используем правильное имя модели из вашего списка: gemini-2.5-flash
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{"parts": [{"text": f"Ты — ассистент психолога. Отвечай мягко и профессионально: {text}"}]}]
+    }
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(url, timeout=15.0)
-            return f"ДОСТУПНЫЕ МОДЕЛИ: {resp.text[:500]}" # Покажет начало списка
+            resp = await client.post(url, json=payload, timeout=15.0)
+            data = resp.json()
+            if "candidates" in data:
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            else:
+                return f"API Ошибка: {data}"
     except Exception as e:
-        return f"Техническая ошибка: {e}"
+        return f"Техническая ошибка: {str(e)}"
 
 # --- WEBHOOKS ---
 @app.post("/telegram")
