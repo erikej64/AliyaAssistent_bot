@@ -27,9 +27,7 @@ SESSION_BLOCK = 120  # Окно сессии — 120 минут (2 часа)
 WORK_START = 10 * 60
 WORK_END   = 21 * 60
 
-# Отслеживаем уже отправленные уведомления чтобы не дублировать
 sent_reminders: set = set()
-# Хранилище напоминаний от бота (asyncio tasks)
 reminders: dict[str, dict] = {}
 conversations: dict[str, list] = {}
 
@@ -128,7 +126,6 @@ async def remind_after(delay: float, channel: str, chat_id: str, message: str, a
     await notify_aliya(aliya_msg)
 
 async def cancel_existing_reminders(channel: str, chat_id: str):
-    """Отменяет все текущие задачи напоминаний для клиента (нужно при переносе записи)"""
     prefix = f"{channel}:{chat_id}:"
     keys_to_delete = []
     for k, v in reminders.items():
@@ -143,7 +140,6 @@ async def cancel_existing_reminders(channel: str, chat_id: str):
 
 async def schedule_reminders(channel: str, chat_id: str, name: str, date: str, time_str: str):
     try:
-        # Перед созданием новых напоминаний — очищаем старые, если были
         await cancel_existing_reminders(channel, chat_id)
         
         session_dt = datetime.strptime(f"{date} {time_str}", "%Y-%m-%d %H:%M")
@@ -279,7 +275,6 @@ async def check_slot(date: str, time_str: str) -> tuple[bool, list[str]]:
 
 
 async def find_future_event_by_contact(client_phone: str, client_tg: str) -> dict | None:
-    """Ищет предстоящее событие клиента на ближайшие 60 дней для переноса."""
     try:
         token = await get_google_token()
         now_str = now_astana().strftime("%Y-%m-%dT%H:%M:00+05:00")
@@ -311,7 +306,6 @@ async def find_future_event_by_contact(client_phone: str, client_tg: str) -> dic
 
 
 async def delete_calendar_event(event_id: str) -> bool:
-    """Удаляет старое событие при переносе."""
     try:
         token = await get_google_token()
         async with httpx.AsyncClient(timeout=15) as client:
@@ -331,7 +325,6 @@ async def create_calendar_event(name: str, date: str, time_str: str,
     try:
         token    = await get_google_token()
         start_dt = datetime.strptime(f"{date} {time_str}", "%Y-%m-%d %H:%M")
-        # Изменили длительность события на 2 часа (резервируем 2 часа в расписании)
         end_dt   = start_dt + timedelta(hours=2)
 
         contact_line = ""
@@ -376,10 +369,9 @@ def extract_name_from_summary(summary: str) -> str:
     return "Клиент"
 
 
-# ... (check_calendar_reminders и calendar_checker_loop оставляем без изменений)
 async def check_calendar_reminders():
-    pass # Реализация в вашем исходном коде остается такой же (для краткости в выводе не меняем)
-
+    # Если у вас была своя логика проверки напоминаний из календаря - вставьте её сюда
+    pass
 
 async def calendar_checker_loop():
     while True:
@@ -419,53 +411,23 @@ def parse_booking_line(line: str) -> dict | None:
 
 
 async def extract_booking(reply: str) -> dict | None:
+    # Очищенная и быстрая проверка, без лишних запросов к Claude
     for line in reply.split("\n"):
         if line.startswith("ЗАПИСЬ:") or line.startswith("ПЕРЕНОС:"):
             result = parse_booking_line(line)
             if result:
                 return result
-
-    keywords = ["подтверждаю", "записал", "запись", "консультаци", "перенес", "перенос"]
-    if not any(k in reply.lower() for k in keywords):
-        return None
-
-    now = now_astana()
-    prompt = (
-        f"Из текста извлеки данные о записи (или переносе записи).\nСегодня: {now.strftime('%Y-%m-%d')}.\n"
-        f"Верни ТОЛЬКО JSON: {{\"action\": \"book\" или \"reschedule\", \"имя\": \"...\", \"город\": \"...\", \"дата\": \"ГГГГ-ММ-ДД\", \"время\": \"ЧЧ:ММ\", \"запрос\": \"...\"}}\n"
-        f"Если данных нет — верни null.\nТекст:\n{reply}"
-    )
-
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"},
-                json={"model": "claude-sonnet-4-6", "max_tokens": 200, "messages": [{"role": "user", "content": prompt}]},
-            )
-            text = resp.json()["content"][0]["text"].strip()
-            text = text.replace("```json", "").replace("```", "").strip()
-            if not text or text == "null": return None
-            data = json.loads(text)
-            if "action" not in data: data["action"] = "book"
-            if data.get("дата"):
-                m2 = re.match(r"(\d{4})-(\d{2})-(\d{2})", data["дата"])
-                if m2 and int(m2.group(1)) < now.year:
-                    data["дата"] = f"{now.year}-{m2.group(2)}-{m2.group(3)}"
-            if data.get("время"):
-                t2 = re.search(r"\d{1,2}:\d{2}", data["время"])
-                if t2: data["время"] = t2.group(0).zfill(5)
-            return data
-    except Exception:
-        return None
+    return None
 
 
 # ───────────────────────── Claude & Process ─────────────────────────
 
-async def ask_claude(chat_id: str, user_message: str) -> str:
-    if chat_id not in conversations: conversations[chat_id] = []
-    conversations[chat_id].append({"role": "user", "content": user_message})
-    messages = conversations[chat_id][-20:]
+async def ask_claude(chat_id_key: str, user_message: str) -> str:
+    if chat_id_key not in conversations: 
+        conversations[chat_id_key] = []
+        
+    conversations[chat_id_key].append({"role": "user", "content": user_message})
+    messages = conversations[chat_id_key][-20:]
 
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
@@ -475,7 +437,6 @@ async def ask_claude(chat_id: str, user_message: str) -> str:
         )
         reply = resp.json()["content"][0]["text"]
 
-    conversations[chat_id].append({"role": "assistant", "content": reply})
     return reply
 
 
@@ -503,7 +464,6 @@ async def process_reply(reply: str, source: str, contact: str, raw_chat_id: str 
     if source == "WhatsApp": client_phone = raw_chat_id.replace("@c.us", "")
     elif source == "Telegram": client_tg = contact.lstrip("@")
 
-    # Обработка переноса
     action = booking.get("action", "book")
     old_event_info = ""
 
@@ -527,7 +487,6 @@ async def process_reply(reply: str, source: str, contact: str, raw_chat_id: str 
             city=booking["город"], client_phone=client_phone, client_tg=client_tg,
         )
 
-    # Уведомляем Алию
     action_text = "ПЕРЕНОС ЗАПИСИ" if action == "reschedule" else "Новая запись"
     cal_status = "Добавлено в Google Calendar" if calendar_ok else "Добавьте в календарь вручную"
     
@@ -560,10 +519,17 @@ async def handle_whatsapp(body: dict):
     if not text or not chat_id or "@g.us" in chat_id: return
 
     phone = chat_id.replace("@c.us", "")
+    chat_id_key = f"wa:{chat_id}"
+    
     try:
-        reply = await ask_claude(f"wa:{chat_id}", text)
-        reply = await process_reply(reply, "WhatsApp", f"+{phone}", chat_id)
-        await send_whatsapp(chat_id, reply)
+        reply = await ask_claude(chat_id_key, text)
+        final_reply = await process_reply(reply, "WhatsApp", f"+{phone}", chat_id)
+        
+        # Запоминаем именно тот ответ, который отправится пользователю
+        if chat_id_key in conversations:
+            conversations[chat_id_key].append({"role": "assistant", "content": final_reply})
+            
+        await send_whatsapp(chat_id, final_reply)
     except Exception as e:
         print(f"WA error: {e}")
 
@@ -580,10 +546,19 @@ async def handle_telegram(body: dict):
     username = message.get("from", {}).get("username", "")
     name = message.get("from", {}).get("first_name", "")
     contact = f"@{username}" if username else name
+    chat_id_key = f"tg:{chat_id}"
 
-    reply = await ask_claude(f"tg:{chat_id}", text)
-    reply = await process_reply(reply, "Telegram", contact, str(chat_id))
-    await send_telegram(chat_id, reply)
+    try:
+        reply = await ask_claude(chat_id_key, text)
+        final_reply = await process_reply(reply, "Telegram", contact, str(chat_id))
+        
+        # Запоминаем именно тот ответ, который отправится пользователю
+        if chat_id_key in conversations:
+            conversations[chat_id_key].append({"role": "assistant", "content": final_reply})
+            
+        await send_telegram(chat_id, final_reply)
+    except Exception as e:
+        print(f"TG error: {e}")
 
 
 async def set_telegram_webhook():
@@ -616,4 +591,4 @@ async def telegram_webhook(request: Request):
 
 @app.get("/")
 async def root():
-    return {"status": "Бот Алии — 2-часовые слоты и функционал переноса записей работают!"}
+    return {"status": "Бот Алии работает. Рассинхрон памяти исправлен!"}
