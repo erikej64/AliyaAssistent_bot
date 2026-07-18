@@ -9,39 +9,31 @@ GREEN_API_TOKEN = os.environ.get("GREEN_API_TOKEN", "")
 
 app = FastAPI()
 
-# Хранилище сессий (в оперативной памяти)
-# Работает стабильно, пока сервер активен.
+# Хранилище сессий
 chat_history = {}
 
-# Жесткий системный промпт: теперь он "администратор-помощник"
-SYSTEM_INSTRUCTION = """Ты — администратор.
-Услуги: Индивидуальная (25к), Парная (35к), Краткосрочная (20к).
-Если клиент хочет записаться:
-1. Если нет имени/города/времени — вежливо запроси.
-2. Если клиент хочет изменить дату/время — уточни новые данные и подтверди изменение.
-3. Помни контекст: если Эрик из Астаны уже представился, не спрашивай это снова.
-Отвечай кратко и профессионально."""
+SYSTEM_INSTRUCTION = """Ты — администратор. Услуги: Индивидуальная (25к), Парная (35к), Краткосрочная (20к).
+Если клиент хочет записаться или изменить запись: собери Имя, Город, Время. 
+Если данные есть — подтверди. Помни контекст диалога."""
 
 async def ask_gemini(text, chat_id):
-    # Инициализация истории для конкретного чата
     if chat_id not in chat_history:
         chat_history[chat_id] = [{"role": "user", "parts": [{"text": SYSTEM_INSTRUCTION}]}]
     
-    # Добавляем сообщение
-    chat_history[chat_id].append({"role": "user", "parts": [{"text": text}]}]
+    chat_history[chat_id].append({"role": "user", "parts": [{"text": text}]})
     
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(url, json={"contents": chat_history[chat_id]}, timeout=20.0)
-            answer = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+            data = resp.json()
+            answer = data["candidates"][0]["content"]["parts"][0]["text"]
             
-            # Добавляем ответ бота в память
-            chat_history[chat_id].append({"role": "model", "parts": [{"text": answer}]}]
+            chat_history[chat_id].append({"role": "model", "parts": [{"text": answer}]})
             return answer
-    except Exception:
-        return "Извините, сейчас заминка. Повторите запрос."
+    except:
+        return "Ошибка соединения. Попробуйте еще раз."
 
 @app.post("/telegram")
 async def telegram_webhook(request: Request):
