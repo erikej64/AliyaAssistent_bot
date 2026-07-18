@@ -9,31 +9,35 @@ GREEN_API_TOKEN = os.environ.get("GREEN_API_TOKEN", "")
 
 app = FastAPI()
 
-# Хранилище сессий
+# Память для диалогов (работает, пока сервер не перезагрузится)
+# Использование: chat_history[chat_id] = [{"role": "user", "parts": [...]}, ...]
 chat_history = {}
 
-SYSTEM_INSTRUCTION = """Ты — администратор. Услуги: Индивидуальная (25к), Парная (35к), Краткосрочная (20к).
-Если клиент хочет записаться или изменить запись: собери Имя, Город, Время. 
-Если данные есть — подтверди. Помни контекст диалога."""
+SYSTEM_INSTRUCTION = """Ты — администратор. Услуги: 
+1. Индивидуальные консультации (25 000 тг/сессия).
+2. Семейная и парная терапия.
+3. Краткосрочная поддержка.
+Если клиент хочет записаться или изменить данные — собери Имя, Город, Время. Если они есть — подтверди."""
 
 async def ask_gemini(text, chat_id):
+    # Инициализация истории, если её нет
     if chat_id not in chat_history:
         chat_history[chat_id] = [{"role": "user", "parts": [{"text": SYSTEM_INSTRUCTION}]}]
     
+    # Добавляем сообщение пользователя
     chat_history[chat_id].append({"role": "user", "parts": [{"text": text}]})
     
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    payload = {"contents": chat_history[chat_id]}
     
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(url, json={"contents": chat_history[chat_id]}, timeout=20.0)
-            data = resp.json()
-            answer = data["candidates"][0]["content"]["parts"][0]["text"]
-            
-            chat_history[chat_id].append({"role": "model", "parts": [{"text": answer}]})
-            return answer
-    except:
-        return "Ошибка соединения. Попробуйте еще раз."
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, json=payload, timeout=20.0)
+        data = resp.json()
+        answer = data["candidates"][0]["content"]["parts"][0]["text"]
+        
+        # Запоминаем ответ бота
+        chat_history[chat_id].append({"role": "model", "parts": [{"text": answer}]})
+        return answer
 
 @app.post("/telegram")
 async def telegram_webhook(request: Request):
