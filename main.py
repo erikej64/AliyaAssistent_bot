@@ -68,24 +68,25 @@ def get_system_prompt() -> str:
 - Год: {year}
 
 СЦЕНАРИЙ 1 - НОВАЯ ЗАПИСЬ:
-Если клиент хочет записаться ВПЕРВЫЕ — собери по очереди (один вопрос за раз):
-1. Имя
-2. Город — важно для часового пояса
-3. Дату и время (учитывай часовые пояса, переведи в Астану UTC+5)
-4. Кратко запрос
-После сбора всех пунктов ОБЯЗАТЕЛЬНО добавь последней строкой:
+Если клиент хочет записаться ВПЕРВЫЕ:
+1. Собери по очереди (один вопрос за раз): Имя, Город (для часового пояса), Дату и время (по Астане), Кратко запрос.
+2. Подведи итог и спроси клиента: "Всё верно?".
+3. ВНИМАНИЕ: ТОЛЬКО ПОСЛЕ ТОГО, как клиент ответит "Да/Верно", сообщи об успешной записи и добавь последней строкой:
 ЗАПИСЬ: Имя: {{имя}} | Город: {{город}} | Дата: {{ГГГГ-ММ-ДД}} | Время: {{ЧЧ:ММ}} | Запрос: {{запрос}}
 
 СЦЕНАРИЙ 2 - ПЕРЕНОС ЗАПИСИ:
-Если клиент просит ПЕРЕНЕСТИ или ИЗМЕНИТЬ время своей текущей записи — помоги подобрать новое время. Как только согласуете новую дату и время, выведи строку:
+Если клиент просит ПЕРЕНЕСТИ или ИЗМЕНИТЬ время своей текущей записи:
+1. Помоги подобрать и согласуй новое время.
+2. Подведи итог и спроси: "Всё верно?".
+3. ВНИМАНИЕ: ТОЛЬКО ПОСЛЕ явного согласия клиента выведи строку:
 ПЕРЕНОС: Имя: {{имя}} | Город: {{город}} | Дата: {{ГГГГ-ММ-ДД}} | Время: {{ЧЧ:ММ}} | Запрос: {{запрос, если известен, или 'Перенос'}}
 
-ВАЖНО:
+ВАЖНЫЕ ПРАВИЛА РАБОТЫ С КОМАНДАМИ (ЗАПИСЬ / ПЕРЕНОС):
 - Дата в формате ГГГГ-ММ-ДД (например {year}-07-15)
 - Время только цифры ЧЧ:ММ по Астане (например 14:00)
-- Строка ЗАПИСЬ или ПЕРЕНОС — строго последняя строка сообщения!
-
-Никогда не обещай гарантированный результат. Не используй маркированные списки со звёздочками."""
+- НИКОГДА не выводи команду ЗАПИСЬ или ПЕРЕНОС на этапе подведения итогов! Ты должен дождаться слова "Да" от пользователя.
+- Выводи команду строго ОДИН РАЗ для каждой успешной записи. Не повторяй ее, если пользователь просто сказал "Спасибо" или "Ок" после успешного оформления.
+- Никогда не обещай гарантированный результат. Не используй маркированные списки со звёздочками."""
 
 
 # ───────────────────────── Отправка сообщений ─────────────────────────
@@ -440,10 +441,11 @@ async def ask_claude(chat_id_key: str, user_message: str) -> str:
     return reply
 
 
-async def process_reply(reply: str, source: str, contact: str, raw_chat_id: str = "") -> str:
+async def process_reply(reply: str, source: str, contact: str, raw_chat_id: str = "") -> tuple[str, bool]:
+    """Возвращает кортеж: (ответ для пользователя, была ли успешна запись в календарь)"""
     booking = await extract_booking(reply)
     if not booking:
-        return reply
+        return reply, False
 
     clean_reply = reply
     for line in reply.split("\n"):
@@ -458,7 +460,7 @@ async def process_reply(reply: str, source: str, contact: str, raw_chat_id: str 
             msg = f"К сожалению, {booking['время']} {booking['дата']} уже занято.\n\nВ этот день рядом свободно: {' и '.join(suggestions)} (по Астане)\n\nКакое время вам подойдёт?"
         else:
             msg = f"К сожалению, {booking['дата']} полностью занят.\n\nДавайте подберём другой день — какая дата вам удобна?"
-        return msg
+        return msg, False
 
     client_phone, client_tg = "", ""
     if source == "WhatsApp": client_phone = raw_chat_id.replace("@c.us", "")
@@ -501,7 +503,7 @@ async def process_reply(reply: str, source: str, contact: str, raw_chat_id: str 
         channel = "tg" if source == "Telegram" else "wa"
         await schedule_reminders(channel, raw_chat_id, booking.get("имя", ""), booking.get("дата", ""), booking.get("время", ""))
 
-    return clean_reply
+    return clean_reply, True
 
 
 # ───────────────────────── Handlers & Startup ─────────────────────────
@@ -523,11 +525,15 @@ async def handle_whatsapp(body: dict):
     
     try:
         reply = await ask_claude(chat_id_key, text)
-        final_reply = await process_reply(reply, "WhatsApp", f"+{phone}", chat_id)
+        final_reply, was_booked = await process_reply(reply, "WhatsApp", f"+{phone}", chat_id)
         
-        # Запоминаем именно тот ответ, который отправится пользователю
+        # Сохраняем системную пометку, чтобы нейросеть не делала дубль-бронь на слово "спасибо"
+        history_content = final_reply
+        if was_booked:
+            history_content += "\n\n[System: Запись успешно внесена в календарь. Больше не используй команду ЗАПИСЬ/ПЕРЕНОС для этого слота.]"
+
         if chat_id_key in conversations:
-            conversations[chat_id_key].append({"role": "assistant", "content": final_reply})
+            conversations[chat_id_key].append({"role": "assistant", "content": history_content})
             
         await send_whatsapp(chat_id, final_reply)
     except Exception as e:
@@ -550,11 +556,15 @@ async def handle_telegram(body: dict):
 
     try:
         reply = await ask_claude(chat_id_key, text)
-        final_reply = await process_reply(reply, "Telegram", contact, str(chat_id))
+        final_reply, was_booked = await process_reply(reply, "Telegram", contact, str(chat_id))
         
-        # Запоминаем именно тот ответ, который отправится пользователю
+        # Сохраняем системную пометку, чтобы нейросеть не делала дубль-бронь на слово "спасибо"
+        history_content = final_reply
+        if was_booked:
+            history_content += "\n\n[System: Запись успешно внесена в календарь. Больше не используй команду ЗАПИСЬ/ПЕРЕНОС для этого слота.]"
+
         if chat_id_key in conversations:
-            conversations[chat_id_key].append({"role": "assistant", "content": final_reply})
+            conversations[chat_id_key].append({"role": "assistant", "content": history_content})
             
         await send_telegram(chat_id, final_reply)
     except Exception as e:
