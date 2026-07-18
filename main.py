@@ -59,7 +59,7 @@ service = get_service()
 async def process_message(platform, chat_id, text):
     if not text: return
     try:
-        model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=SYSTEM_PROMPT)
+        model = genai.GenerativeModel(model_name="gemini-3-flash-preview", system_instruction=SYSTEM_PROMPT)
         reply = model.generate_content(text).text
         
         if "{" in reply and "}" in reply:
