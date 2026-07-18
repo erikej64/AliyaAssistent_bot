@@ -13,17 +13,21 @@ app = FastAPI()
 
 # --- ЛОГИКА GEMINI ---
 async def ask_gemini(text):
-    # Прямой запрос к модели без лишних проверок
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [{"parts": [{"text": f"Ты — ассистент психолога. Отвечай мягко и профессионально: {text}"}]}]
     }
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.post(url, json=payload, timeout=10.0)
-            return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+            resp = await client.post(url, json=payload, timeout=15.0)
+            data = resp.json()
+            # Добавим вывод ошибки, если она есть в ответе
+            if "candidates" in data:
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            else:
+                return f"API Ошибка: {data}" # Бот пришлет подробности ошибки
     except Exception as e:
-        return f"Техническая ошибка: {e}"
+        return f"Техническая ошибка: {str(e)}"
 
 # --- WEBHOOKS ---
 @app.post("/telegram")
