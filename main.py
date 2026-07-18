@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request
 
 # Инициализация
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('gemini-3-flash-preview')
 app = FastAPI()
 
 # --- ВАША ЛОГИКА ---
