@@ -15,6 +15,7 @@ app = FastAPI()
 
 # Конфигурация
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+MODEL_NAME = "gemini-3.0-flash" 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
@@ -59,7 +60,7 @@ service = get_service()
 async def process_message(platform, chat_id, text):
     if not text: return
     try:
-        model = genai.GenerativeModel(model_name="gemini-3-flash-preview", system_instruction=SYSTEM_PROMPT)
+        model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=SYSTEM_PROMPT)
         reply = model.generate_content(text).text
         
         if "{" in reply and "}" in reply:
