@@ -1,12 +1,8 @@
-# fly.toml app configuration file generated for aliyaassistent-bot-vfjd2w on 2026-07-15T07:25:22Z
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
-
 app = 'aliyaassistent-bot-vfjd2w'
 primary_region = 'ams'
 
 [build]
+  dockerfile = "Dockerfile"
 
 [http_service]
   internal_port = 8080
@@ -16,8 +12,10 @@ primary_region = 'ams'
   min_machines_running = 1
   processes = ['app']
 
+[env]
+  PORT = "8080"
+
 [[vm]]
-  memory = '1gb'
+  memory = '512mb'
   cpu_kind = 'shared'
   cpus = 1
-  memory_mb = 512
