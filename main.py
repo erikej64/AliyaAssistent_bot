@@ -13,8 +13,8 @@ app = FastAPI()
 
 # --- ЛОГИКА GEMINI ---
 async def ask_gemini(text):
-    # Используем версию v1beta и модель gemini-1.5-flash-latest
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
+    # Переходим на проверенную временем модель gemini-1.0-pro
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.0-pro:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [{"parts": [{"text": f"Ты — ассистент психолога. Отвечай мягко и профессионально: {text}"}]}]
     }
