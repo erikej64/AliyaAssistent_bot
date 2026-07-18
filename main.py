@@ -4,22 +4,23 @@ import httpx
 import google.generativeai as genai
 from fastapi import FastAPI, Request
 
-# Конфигурация
+# Инициализация ключа
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-model = genai.GenerativeModel('gemini-1.5-flash')
+
+# Я ПРОПИСАЛ ВЕРНУЮ МОДЕЛЬ ЗДЕСЬ (как на вашем скриншоте из AI Studio):
+model = genai.GenerativeModel('gemini-3-flash-preview')
 app = FastAPI()
 
-# Синхронная функция (без await)
 def ask_gemini(user_message: str) -> str:
     try:
         chat = model.start_chat(history=[])
+        # Синхронный вызов без await
         response = chat.send_message(user_message)
         return response.text
     except Exception as e:
         print(f"Ошибка Gemini: {e}")
         return "Ошибка при получении ответа от ИИ."
 
-# Эндпоинт Telegram
 @app.post("/telegram")
 async def telegram_webhook(request: Request):
     data = await request.json()
@@ -30,7 +31,7 @@ async def telegram_webhook(request: Request):
     if text and chat_id:
         reply = ask_gemini(text)
         
-        # Отправка ответа через httpx (вместо requests)
+        # Отправка ответа в Telegram
         bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         async with httpx.AsyncClient() as client:
