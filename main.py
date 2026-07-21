@@ -13,7 +13,13 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Конфигурация
+#@app.on_event("startup")
+async def startup_event():
+    if TELEGRAM_BOT_TOKEN:
+        webhook_url = "https://aliyaassistant-bot-vfjd2w.fly.dev/webhook"
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook?url={webhook_url}"
+        async with httpx.AsyncClient() as client:
+            await client.get(url) Конфигурация
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 MODEL_NAME = "gemini-3-flash-preview" 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
