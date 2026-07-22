@@ -12,9 +12,25 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+app = FastAPI()
+
 @app.get("/")
 async def root():
     return {"status": "online", "message": "AliyaAssistent bot is running"}
+
+@app.on_event("startup")
+async def startup_event():
+    if TELEGRAM_TOKEN:
+        # Автоматическая установка вебхука на ваш домен Fly.io при запуске
+        webhook_url = "https://aliyaassistent-bot-vfjd2w.fly.dev/webhook"
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={webhook_url}"
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.get(url)
+                logger.info(f"Установка вебхука Telegram: {response.text}")
+            except Exception as e:
+                logger.error(f"Не удалось установить вебхук: {e}")
+
 # Конфигурация (имя переменной TELEGRAM_TOKEN теперь совпадает с секретами Fly.io)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 MODEL_NAME = "gemini-3-flash-preview"  
