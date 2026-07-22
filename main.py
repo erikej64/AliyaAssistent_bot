@@ -13,20 +13,15 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-#@app.on_event("startup")
-async def startup_event():
-    if TELEGRAM_BOT_TOKEN:
-        webhook_url = "https://aliyaassistant-bot-vfjd2w.fly.dev/webhook"
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook?url={webhook_url}"
-        async with httpx.AsyncClient() as client:
-            await client.get(url) Конфигурация
+# Конфигурация (имя переменной TELEGRAM_TOKEN теперь совпадает с секретами Fly.io)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-MODEL_NAME = "gemini-3-flash-preview" 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+MODEL_NAME = "gemini-3-flash-preview"  
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "credentials.json")
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS", "")
 ALYA_CHAT_ID_TG = os.getenv("ALYA_CHAT_ID_TG", "")
 
 genai.configure(api_key=GEMINI_API_KEY)
@@ -42,7 +37,7 @@ SYSTEM_PROMPT = (
 async def send_message(platform, to, text):
     try:
         if platform == "telegram":
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             async with httpx.AsyncClient() as client:
                 await client.post(url, json={"chat_id": to, "text": text})
         elif platform == "whatsapp":
@@ -54,11 +49,21 @@ async def send_message(platform, to, text):
         logger.error(f"Ошибка отправки: {e}")
 
 def get_service():
+    # Автоматически создаем credentials.json из секрета Fly.io, если файл еще не создан
+    if not os.path.exists(GOOGLE_SERVICE_ACCOUNT_FILE) and GOOGLE_CREDENTIALS:
+        try:
+            with open(GOOGLE_SERVICE_ACCOUNT_FILE, "w", encoding="utf-8") as f:
+                f.write(GOOGLE_CREDENTIALS)
+        except Exception as e:
+            logger.error(f"Не удалось записать credentials.json: {e}")
+
     if os.path.exists(GOOGLE_SERVICE_ACCOUNT_FILE):
         try:
             creds = Credentials.from_service_account_file(GOOGLE_SERVICE_ACCOUNT_FILE, scopes=['https://www.googleapis.com/auth/calendar'])
             return build('calendar', 'v3', credentials=creds)
-        except: return None
+        except Exception as e:
+            logger.error(f"Ошибка инициализации Google Calendar API: {e}")
+            return None
     return None
 
 service = get_service()
@@ -78,7 +83,7 @@ async def process_message(platform, chat_id, text):
                         now = datetime.utcnow().isoformat() + 'Z'
                         events = service.events().list(calendarId=GOOGLE_CALENDAR_ID, timeMin=now, q=chat_id).execute().get('items', [])
                         for e in events: service.events().delete(calendarId=GOOGLE_CALENDAR_ID, eventId=e['id']).execute()
-                    
+                
                     start_dt = datetime.strptime(f"{cmd['date']} {cmd['time']}", "%Y-%m-%d %H:%M").replace(tzinfo=ASTANA_TZ)
                     service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body={
                         'summary': f'Client:{platform}:{chat_id}',
@@ -92,7 +97,7 @@ async def process_message(platform, chat_id, text):
         
         await send_message(platform, chat_id, reply)
     except Exception as e:
-        logger.error(f"Ошибка в процессе: {e}")
+        logger.error(f"Ошибка в процессе обработки сообщения: {e}")
 
 @app.post("/webhook")
 @app.post("/telegram")
@@ -105,5 +110,6 @@ async def webhook(request: Request):
             changes = data["entry"][0]["changes"][0]["value"]
             if "messages" in changes:
                 await process_message("whatsapp", str(changes["messages"][0]["from"]), changes["messages"][0]["text"]["body"])
-    except: pass
+    except Exception as e:
+        logger.error(f"Ошибка в обработчике вебхука: {e}")
     return {"status": "ok"}
