@@ -12,7 +12,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
-
+@app.get("/")
+async def root():
+    return {"status": "online", "message": "AliyaAssistent bot is running"}
 # Конфигурация (имя переменной TELEGRAM_TOKEN теперь совпадает с секретами Fly.io)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 MODEL_NAME = "gemini-3-flash-preview"  
