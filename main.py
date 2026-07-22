@@ -45,11 +45,20 @@ ALYA_CHAT_ID_TG = os.getenv("ALYA_CHAT_ID_TG", "")
 genai.configure(api_key=GEMINI_API_KEY)
 ASTANA_TZ = timezone(timedelta(hours=5))
 
+# Динамическое определение сегодняшней даты по времени Астаны
+months_ru = {
+    1: "января", 2: "февраля", 3: "марта", 4: "апреля", 
+    5: "мая", 6: "июня", 7: "июля", 8: "августа", 
+    9: "сентября", 10: "октября", 11: "ноября", 12: "декабря"
+}
+now_astana = datetime.now(ASTANA_TZ)
+today_str = f"{now_astana.day} {months_ru[now_astana.month]} {now_astana.year} года"
+
 SYSTEM_PROMPT = (
     "Ты — ассистент психолога Алии. Принимаешь записи онлайн (1.5 часа, 25 000 тенге, 10:00-21:00 Астана). "
     "Если клиент хочет записаться, используй JSON: " + '{"action": "check_slot", "date": "YYYY-MM-DD", "time": "HH:MM"}. ' +
     "Если клиент хочет перенести, используй JSON: " + '{"action": "reschedule_slot", "date": "YYYY-MM-DD", "time": "HH:MM"}. ' +
-    "Пиши эмпатично, JSON добавляй только для команд. Сегодня 18 июля 2026 года."
+    f"Пиши эмпатично, JSON добавляй только для команд. Сегодня {today_str}."
 )
 
 async def send_message(platform, to, text):
